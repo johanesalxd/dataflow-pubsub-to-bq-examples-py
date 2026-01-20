@@ -143,11 +143,15 @@ Follow these strict guidelines when writing or refactoring code.
 ```
 dataflow-pubsub-to-bq-examples-py/
 ├── dataflow_pubsub_to_bq/      # Main package
-│   ├── pipeline.py             # Pipeline entry point
+│   ├── pipeline.py             # Pipeline entry point (Standard Flattened)
+│   ├── pipeline_json.py        # Pipeline entry point (Raw JSON)
 │   ├── pipeline_options.py     # Options configuration
 │   └── transforms/             # Custom Beam transforms
+│       ├── json_to_tablerow.py # Standard parsing logic
+│       └── raw_json.py         # Raw JSON parsing logic
 ├── run_local.sh                # Local execution script
-├── run_dataflow.sh             # Dataflow deployment script
+├── run_dataflow.sh             # Dataflow deployment script (Standard)
+├── run_dataflow_json.sh        # Dataflow deployment script (Raw JSON)
 └── pyproject.toml              # Build & dependencies
 ```
 

@@ -14,6 +14,9 @@ Pub/Sub (taxirides-realtime) -> Dataflow Pipeline -> BigQuery (taxi_events)
 - Parses taxi ride JSON messages
 - Captures Pub/Sub metadata (subscription_name, message_id, publish_time, attributes)
 - Writes to partitioned and clustered BigQuery table
+- **Dual Pipeline Support:**
+  - Standard: Flattens JSON fields into specific columns.
+  - Raw JSON: Ingests the full payload into a BigQuery `JSON` column.
 - Uses BigQuery Storage Write API for optimal performance
 - Micro-batching with 1-second flush intervals
 - Supports both local (DirectRunner) and production (DataflowRunner with Runner V2)
@@ -22,17 +25,21 @@ Pub/Sub (taxirides-realtime) -> Dataflow Pipeline -> BigQuery (taxi_events)
 
 ```
 dataflow-pubsub-to-bq-examples-py/
-├── README.md                 # This file
-├── pyproject.toml           # Project configuration and dependencies (uv)
-├── run_local.sh             # Local testing script
-├── run_dataflow.sh          # Production Dataflow deployment script
+├── README.md                   # This file
+├── AGENTS.md                   # Guidelines for AI agents
+├── pyproject.toml              # Project configuration and dependencies (uv)
+├── run_local.sh                # Local testing script
+├── run_dataflow.sh             # Production Dataflow deployment script (Flattened Schema)
+├── run_dataflow_json.sh        # Production Dataflow deployment script (JSON Column)
 └── dataflow_pubsub_to_bq/
     ├── __init__.py
-    ├── pipeline.py          # Main pipeline code
-    ├── pipeline_options.py  # Custom pipeline options
+    ├── pipeline.py             # Main pipeline code (Flattened)
+    ├── pipeline_json.py        # Alternative pipeline code (Raw JSON)
+    ├── pipeline_options.py     # Custom pipeline options
     └── transforms/
         ├── __init__.py
-        └── json_to_tablerow.py  # JSON parsing transform
+        ├── json_to_tablerow.py # JSON parsing transform (Flattened)
+        └── raw_json.py         # Raw JSON parsing transform
 ```
 
 ## Input Data Format
@@ -119,6 +126,8 @@ This script will:
 
 ### Production Deployment (DataflowRunner)
 
+**Option 1: Standard Flattened Schema**
+
 ```bash
 ./run_dataflow.sh
 ```
@@ -130,6 +139,19 @@ This script will:
 4. Check/create Pub/Sub subscription
 5. Install Python dependencies
 6. Submit pipeline to Dataflow with Runner V2
+
+**Option 2: Raw JSON Column Schema**
+
+```bash
+./run_dataflow_json.sh
+```
+
+This pipeline ingests the entire message payload into a specific BigQuery `JSON` column named `payload`, along with standard metadata fields. This is useful for:
+- Handling semi-structured data
+- Schema evolution without table updates
+- Preserving original message fidelity
+
+The output table is `taxi_events_json`.
 
 ## Performance Optimizations
 
