@@ -1,5 +1,6 @@
 package com.johanesalxd;
 
+import com.johanesalxd.schemas.DeadLetterBigQuerySchema;
 import com.johanesalxd.schemas.RawJsonBigQuerySchema;
 import com.johanesalxd.transforms.PubsubMessageToRawJson;
 import org.apache.beam.sdk.Pipeline;
@@ -7,6 +8,8 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollectionTuple;
+import org.apache.beam.sdk.values.TupleTagList;
 import org.joda.time.Duration;
 
 public class PubSubToBigQueryJson {
@@ -20,19 +23,31 @@ public class PubSubToBigQueryJson {
     // Create the pipeline
     Pipeline pipeline = Pipeline.create(options);
 
-    // Read from Pub/Sub
-    pipeline
+    // Read from Pub/Sub and Parse
+    PCollectionTuple results = pipeline
         .apply("ReadFromPubSub", PubsubIO.readMessagesWithAttributes()
             .fromSubscription(options.getSubscription()))
-
-        // Parse messages to TableRow
         .apply("ParseMessagesToRawJson", ParDo.of(
-            new PubsubMessageToRawJson(options.getSubscriptionName())))
+            new PubsubMessageToRawJson(options.getSubscriptionName()))
+            .withOutputTags(PubsubMessageToRawJson.SUCCESS_TAG, 
+                TupleTagList.of(PubsubMessageToRawJson.DLQ_TAG)));
 
-        // Write to BigQuery using Storage Write API
+    // Write Success to BigQuery
+    results.get(PubsubMessageToRawJson.SUCCESS_TAG)
         .apply("WriteToBigQuery", BigQueryIO.writeTableRows()
             .to(options.getOutputTable())
             .withSchema(RawJsonBigQuerySchema.getSchema())
+            .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
+            .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED)
+            .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API)
+            .withTriggeringFrequency(Duration.standardSeconds(1))
+        );
+
+    // Write Failures to BigQuery DLQ
+    results.get(PubsubMessageToRawJson.DLQ_TAG)
+        .apply("WriteToDLQ", BigQueryIO.writeTableRows()
+            .to(options.getOutputTable() + "_dlq")
+            .withSchema(DeadLetterBigQuerySchema.getSchema())
             .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
             .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED)
             .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API)
