@@ -18,18 +18,17 @@ class PubSubToBigQueryOptions(PipelineOptions):
             parser: ArgumentParser object to add arguments to.
         """
         parser.add_argument(
-            '--subscription',
+            "--subscription",
             required=True,
-            help='Pub/Sub subscription name (e.g., projects/PROJECT_ID/subscriptions/SUBSCRIPTION_NAME)',
+            help="Pub/Sub subscription name (e.g., projects/PROJECT_ID/subscriptions/SUBSCRIPTION_NAME)",
         )
         parser.add_argument(
-            '--output_table',
+            "--output_table",
             required=True,
-            help='BigQuery output table (e.g., PROJECT_ID:DATASET.TABLE)',
+            help="BigQuery output table (e.g., PROJECT_ID:DATASET.TABLE)",
         )
         parser.add_argument(
-            '--subscription_name',
-            required=False,
-            default='taxi_telemetry',
-            help='Subscription name to record in BigQuery (default: taxi_telemetry)',
+            "--subscription_name",
+            required=True,
+            help="Subscription name to record in BigQuery metadata",
         )
