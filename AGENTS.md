@@ -33,13 +33,6 @@ This project uses `uv` for fast package management.
 ## 3. Development Commands
 
 ### Running the Pipeline
-- **Local Testing (DirectRunner):**
-  Use the provided shell script to run locally. This sets up necessary resources and runs the pipeline.
-  ```bash
-  ./run_local.sh
-  ```
-  *Ensure you have authenticated with `gcloud auth application-default login`.*
-
 - **Production Deployment (Dataflow):**
   Submits the job to Dataflow.
   ```bash
@@ -47,23 +40,15 @@ This project uses `uv` for fast package management.
   ```
 
 ### Testing
-*Note: formalized tests are currently being established. Please follow these guidelines when adding tests.*
+*Note: formalized tests are currently being established. The test suite is not yet implemented.*
 
-- **Run Tests:**
-  ```bash
-  uv run pytest
-  ```
-- **Run Single Test:**
-  ```bash
-  uv run pytest tests/test_file.py::test_function_name
-  ```
 - **Test Location:**
   Place all unit tests in a `tests/` directory at the project root.
 - **Test Style:**
   Use `pytest` fixtures and parameterized tests where possible. Mock external GCP services (Pub/Sub, BigQuery) using `unittest.mock`.
 
 ### Linting & Formatting
-*Recommended tools (configuration to be added to `pyproject.toml`):*
+*Recommended tools (requires `uv add --dev ruff` first, as configuration is to be added to `pyproject.toml`):*
 
 - **Lint:**
   ```bash
@@ -149,7 +134,7 @@ dataflow-pubsub-to-bq-examples-py/
 │   └── transforms/             # Custom Beam transforms
 │       ├── json_to_tablerow.py # Standard parsing logic
 │       └── raw_json.py         # Raw JSON parsing logic
-├── run_local.sh                # Local execution script
+├── images/                     # Project images
 ├── run_dataflow.sh             # Dataflow deployment script (Standard)
 ├── run_dataflow_json.sh        # Dataflow deployment script (Raw JSON)
 └── pyproject.toml              # Build & dependencies
