@@ -20,8 +20,8 @@ def matches_dlq_error(expected_payload):
             raise ValueError("DLQ row missing 'error_message'")
         if not row.get("stack_trace"):
             raise ValueError("DLQ row missing 'stack_trace'")
-        if not row.get("timestamp"):
-            raise ValueError("DLQ row missing 'timestamp'")
+        if not row.get("processing_time"):
+            raise ValueError("DLQ row missing 'processing_time'")
 
     return _matcher
 
@@ -76,3 +76,30 @@ def test_process_malformed_message():
 
         # Check DLQ output
         assert_that(results.dlq, matches_dlq_error(invalid_json), label="CheckDLQ")
+
+
+def test_process_preserves_raw_formatting():
+    """Test that valid JSON messages preserve original formatting (whitespace)."""
+    subscription = "projects/test/subscriptions/sub"
+    # JSON with irregular whitespace (valid)
+    raw_payload = '{"ride_id":   "123", "passenger_count":\n 1}'
+    message = PubsubMessage(
+        data=raw_payload.encode("utf-8"), attributes={"source": "test"}
+    )
+
+    with TestPipeline() as p:
+        results = (
+            p
+            | beam.Create([message])
+            | beam.ParDo(ParsePubSubMessageToRawJson(subscription)).with_outputs(
+                "dlq", main="success"
+            )
+        )
+
+        # Check success output matches RAW string exactly (no normalization)
+        assert_that(
+            results.success,
+            lambda elements: len(elements) == 1
+            and elements[0]["payload"] == raw_payload,
+            label="CheckRawPreservation",
+        )

@@ -52,6 +52,7 @@ public class PubsubMessageToRawJson extends DoFn<PubsubMessage, TableRow> {
       row.set("subscription_name", this.subscriptionName);
       row.set("message_id", messageId);
       row.set("publish_time", timestamp.toString());
+      row.set("processing_time", Instant.now().toString());
       row.set("attributes", attributesJson);
       // In Python: json.dumps(json_payload). In Java, payload is already the JSON string.
       // BQ JSON type expects a JSON string.
@@ -67,7 +68,7 @@ public class PubsubMessageToRawJson extends DoFn<PubsubMessage, TableRow> {
       e.printStackTrace(new PrintWriter(sw));
       
       TableRow errorRow = new TableRow();
-      errorRow.set("timestamp", Instant.now().toString());
+      errorRow.set("processing_time", Instant.now().toString());
       errorRow.set("error_message", e.getMessage());
       errorRow.set("stack_trace", sw.toString());
       errorRow.set("original_payload", payload.isEmpty() && message.getPayload() != null 

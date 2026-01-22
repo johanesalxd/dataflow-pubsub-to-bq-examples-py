@@ -23,6 +23,10 @@ public class RawJsonBigQuerySchema {
             .setType("TIMESTAMP")
             .setMode("NULLABLE"),
         new TableFieldSchema()
+            .setName("processing_time")
+            .setType("TIMESTAMP")
+            .setMode("NULLABLE"),
+        new TableFieldSchema()
             .setName("attributes")
             .setType("STRING")
             .setMode("NULLABLE"),

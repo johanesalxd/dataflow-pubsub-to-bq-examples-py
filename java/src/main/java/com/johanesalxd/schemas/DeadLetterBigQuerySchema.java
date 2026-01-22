@@ -11,7 +11,7 @@ public class DeadLetterBigQuerySchema {
   public static TableSchema getSchema() {
     return new TableSchema().setFields(Arrays.asList(
         new TableFieldSchema()
-            .setName("timestamp")
+            .setName("processing_time")
             .setType("TIMESTAMP")
             .setMode("NULLABLE"),
         new TableFieldSchema()

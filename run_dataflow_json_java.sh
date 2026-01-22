@@ -65,13 +65,27 @@ if ! bq show ${FULL_TABLE} 2>/dev/null; then
         --time_partitioning_field=publish_time \
         --time_partitioning_type=DAY \
         --clustering_fields=publish_time \
-        --schema=subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,attributes:STRING,payload:JSON \
+        --schema=subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,processing_time:TIMESTAMP,attributes:STRING,payload:JSON \
         ${FULL_TABLE}
 else
     echo "BigQuery table already exists."
 fi
 
-# 4. Check/Create Pub/Sub subscription
+# 4. Check/Create BigQuery DLQ table
+echo "Checking BigQuery DLQ table..."
+if ! bq show ${FULL_TABLE}_dlq 2>/dev/null; then
+    echo "Creating BigQuery DLQ table..."
+    bq mk \
+        --table \
+        --time_partitioning_field=processing_time \
+        --time_partitioning_type=DAY \
+        --schema=processing_time:TIMESTAMP,error_message:STRING,stack_trace:STRING,original_payload:STRING,subscription_name:STRING \
+        ${FULL_TABLE}_dlq
+else
+    echo "BigQuery DLQ table already exists."
+fi
+
+# 5. Check/Create Pub/Sub subscription
 echo "Checking Pub/Sub subscription..."
 if ! gcloud pubsub subscriptions describe ${SUBSCRIPTION_NAME} --project=${PROJECT_ID} 2>/dev/null; then
     echo "Creating Pub/Sub subscription..."

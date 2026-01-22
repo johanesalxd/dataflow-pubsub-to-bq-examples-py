@@ -66,7 +66,7 @@ if ! bq show ${FULL_TABLE} 2>/dev/null; then
         --time_partitioning_field=publish_time \
         --time_partitioning_type=DAY \
         --clustering_fields=publish_time \
-        --schema=subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,attributes:STRING,payload:JSON \
+        --schema=subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,processing_time:TIMESTAMP,attributes:STRING,payload:JSON \
         ${FULL_TABLE}
 else
     echo "BigQuery table already exists."
@@ -78,9 +78,9 @@ if ! bq show ${FULL_TABLE}_dlq 2>/dev/null; then
     echo "Creating BigQuery DLQ table..."
     bq mk \
         --table \
-        --time_partitioning_field=timestamp \
+        --time_partitioning_field=processing_time \
         --time_partitioning_type=DAY \
-        --schema=timestamp:TIMESTAMP,error_message:STRING,stack_trace:STRING,original_payload:STRING,subscription_name:STRING \
+        --schema=processing_time:TIMESTAMP,error_message:STRING,stack_trace:STRING,original_payload:STRING,subscription_name:STRING \
         ${FULL_TABLE}_dlq
 else
     echo "BigQuery DLQ table already exists."

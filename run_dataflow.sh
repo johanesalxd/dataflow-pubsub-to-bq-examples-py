@@ -69,7 +69,7 @@ if ! bq show ${FULL_TABLE} 2>/dev/null; then
         --time_partitioning_field=publish_time \
         --time_partitioning_type=DAY \
         --clustering_fields=publish_time \
-        --schema=subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,ride_id:STRING,point_idx:INT64,latitude:FLOAT,longitude:FLOAT,timestamp:TIMESTAMP,meter_reading:FLOAT,meter_increment:FLOAT,ride_status:STRING,passenger_count:INT64,attributes:STRING \
+        --schema=subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,processing_time:TIMESTAMP,ride_id:STRING,point_idx:INT64,latitude:FLOAT,longitude:FLOAT,timestamp:TIMESTAMP,meter_reading:FLOAT,meter_increment:FLOAT,ride_status:STRING,passenger_count:INT64,attributes:STRING \
         ${FULL_TABLE}
 else
     echo "BigQuery table already exists."

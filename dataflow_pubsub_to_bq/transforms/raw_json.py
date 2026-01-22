@@ -43,12 +43,12 @@ class ParsePubSubMessageToRawJson(beam.DoFn):
             message_data = element.data.decode("utf-8")
 
             # Verify it's valid JSON, but keep the structure for the JSON column
-            # We parse it just to ensure validity and strict error handling
-            json_payload = json.loads(message_data)
+            # We parse it just to ensure validity and strict error handling (DLQ trigger).
+            # If this raises a JSONDecodeError, it goes to the DLQ.
+            json.loads(message_data)
 
             # Extract Pub/Sub metadata (for data quality checks)
-            message_id = element.message_id if hasattr(
-                element, "message_id") else ""
+            message_id = element.message_id if hasattr(element, "message_id") else ""
 
             # Convert to Beam Timestamp for Storage Write API compatibility
             if hasattr(element, "publish_time") and element.publish_time:
@@ -56,19 +56,31 @@ class ParsePubSubMessageToRawJson(beam.DoFn):
             else:
                 publish_time = Timestamp.of(time.time())
 
+            # Capture processing time (wall-clock time of the worker)
+            # distinct from publish_time to track pipeline lag/backlog.
+            processing_time = Timestamp.of(time.time())
+
             # Extract custom attributes from the message (if any)
             attributes = element.attributes if element.attributes else {}
 
             # Create BigQuery row
-            # Note: For BigQuery JSON type, we pass the Python dict directly
+            # SCHEMA TRICK:
+            # 1. The BigQuery table has a 'payload' column of type JSON.
+            # 2. The Beam Schema (get_raw_json_bigquery_schema) defines 'payload' as STRING.
+            # 3. We pass the raw JSON string here.
+            # 4. The BigQuery Storage Write API handles the String -> JSON conversion automatically.
+            #
+            # We do NOT use json.dumps(json.loads(...)) to avoid re-serialization overhead
+            # and to preserve the original message fidelity (whitespace, ordering).
             bq_row = {
                 # Pub/Sub metadata
                 "subscription_name": self.subscription_name,
                 "message_id": message_id,
                 "publish_time": publish_time,
+                "processing_time": processing_time,
                 "attributes": json.dumps(attributes),
-                # The payload itself as a JSON string
-                "payload": json.dumps(json_payload),
+                # Pass the original raw string directly
+                "payload": message_data,
             }
 
             yield bq_row
@@ -87,7 +99,7 @@ class ParsePubSubMessageToRawJson(beam.DoFn):
                 original_payload = str(element.data)
 
             error_row = {
-                "timestamp": Timestamp.of(time.time()),
+                "processing_time": Timestamp.of(time.time()),
                 "error_message": str(e),
                 "stack_trace": stack_trace,
                 "original_payload": original_payload,
@@ -106,6 +118,7 @@ def get_raw_json_bigquery_schema() -> list:
         {"name": "subscription_name", "type": "STRING", "mode": "NULLABLE"},
         {"name": "message_id", "type": "STRING", "mode": "NULLABLE"},
         {"name": "publish_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {"name": "processing_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
         {"name": "attributes", "type": "STRING", "mode": "NULLABLE"},
         # Defined as STRING for Beam validation
         {"name": "payload", "type": "STRING", "mode": "NULLABLE"},
@@ -119,7 +132,7 @@ def get_dead_letter_bigquery_schema() -> list:
         List of BigQuery schema field definitions.
     """
     return [
-        {"name": "timestamp", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {"name": "processing_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
         {"name": "error_message", "type": "STRING", "mode": "NULLABLE"},
         {"name": "stack_trace", "type": "STRING", "mode": "NULLABLE"},
         {"name": "original_payload", "type": "STRING", "mode": "NULLABLE"},
