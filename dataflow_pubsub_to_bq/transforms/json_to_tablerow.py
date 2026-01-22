@@ -4,10 +4,12 @@ from datetime import datetime
 import json
 import logging
 import time
+import traceback
 from typing import Any
 
 import apache_beam as beam
 from apache_beam.io.gcp.pubsub import PubsubMessage
+from apache_beam.pvalue import TaggedOutput
 from apache_beam.utils.timestamp import Timestamp
 
 
@@ -28,6 +30,7 @@ class ParsePubSubMessage(beam.DoFn):
         """
         self.subscription_name = subscription_name
 
+
     def process(self, element: PubsubMessage) -> Any:
         """Processes a single Pub/Sub message.
 
@@ -36,6 +39,7 @@ class ParsePubSubMessage(beam.DoFn):
 
         Yields:
             Dictionary with all fields for BigQuery insertion.
+            Or TaggedOutput('dlq', error_row) on failure.
         """
         try:
             # Decode the message data
@@ -94,10 +98,25 @@ class ParsePubSubMessage(beam.DoFn):
 
             yield bq_row
 
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse JSON: {e}, data: {element.data}")
         except Exception as e:
-            logging.error(f"Error processing message: {e}")
+            # Capture full stack trace
+            stack_trace = traceback.format_exc()
+
+            # Safe payload extraction
+            try:
+                original_payload = element.data.decode("utf-8")
+            except Exception:
+                # Fallback if decoding fails
+                original_payload = str(element.data)
+
+            error_row = {
+                "processing_time": Timestamp.of(time.time()),
+                "error_message": str(e),
+                "stack_trace": stack_trace,
+                "original_payload": original_payload,
+                "subscription_name": self.subscription_name,
+            }
+            yield TaggedOutput("dlq", error_row)
 
 
 def get_bigquery_schema() -> list:

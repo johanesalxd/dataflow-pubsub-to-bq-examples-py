@@ -13,6 +13,7 @@ from apache_beam.options.pipeline_options import PipelineOptions
 from dataflow_pubsub_to_bq.pipeline_options import PubSubToBigQueryOptions
 from dataflow_pubsub_to_bq.transforms.json_to_tablerow import get_bigquery_schema
 from dataflow_pubsub_to_bq.transforms.json_to_tablerow import ParsePubSubMessage
+from dataflow_pubsub_to_bq.transforms.raw_json import get_dead_letter_bigquery_schema
 
 
 def run(argv=None):
@@ -34,14 +35,33 @@ def run(argv=None):
         )
 
         # Parse messages and write to BigQuery with Storage Write API
-        (
+        rows = (
             messages
             | "ParseMessages"
             >> beam.ParDo(ParsePubSubMessage(custom_options.subscription_name))
+            .with_outputs("dlq", main="success")
+        )
+
+        (
+            rows.success
             | "WriteToBigQuery"
             >> bigquery.WriteToBigQuery(
                 table=custom_options.output_table,
                 schema={"fields": get_bigquery_schema()},
+                write_disposition=bigquery.BigQueryDisposition.WRITE_APPEND,
+                create_disposition=bigquery.BigQueryDisposition.CREATE_NEVER,
+                method=bigquery.WriteToBigQuery.Method.STORAGE_WRITE_API,
+                triggering_frequency=1,
+            )
+        )
+
+        # Write Failures to BigQuery DLQ
+        (
+            rows.dlq
+            | "WriteFailuresToBigQuery"
+            >> bigquery.WriteToBigQuery(
+                table=f"{custom_options.output_table}_dlq",
+                schema={"fields": get_dead_letter_bigquery_schema()},
                 write_disposition=bigquery.BigQueryDisposition.WRITE_APPEND,
                 create_disposition=bigquery.BigQueryDisposition.CREATE_NEVER,
                 method=bigquery.WriteToBigQuery.Method.STORAGE_WRITE_API,

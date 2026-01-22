@@ -75,7 +75,21 @@ else
     echo "BigQuery table already exists."
 fi
 
-# 4. Check/Create Pub/Sub subscription
+# 4. Check/Create BigQuery DLQ table
+echo "Checking BigQuery DLQ table..."
+if ! bq show ${FULL_TABLE}_dlq 2>/dev/null; then
+    echo "Creating BigQuery DLQ table..."
+    bq mk \
+        --table \
+        --time_partitioning_field=processing_time \
+        --time_partitioning_type=DAY \
+        --schema=processing_time:TIMESTAMP,error_message:STRING,stack_trace:STRING,original_payload:STRING,subscription_name:STRING \
+        ${FULL_TABLE}_dlq
+else
+    echo "BigQuery DLQ table already exists."
+fi
+
+# 5. Check/Create Pub/Sub subscription
 echo "Checking Pub/Sub subscription..."
 if ! gcloud pubsub subscriptions describe ${SUBSCRIPTION_NAME} --project=${PROJECT_ID} 2>/dev/null; then
     echo "Creating Pub/Sub subscription..."
@@ -86,17 +100,17 @@ else
     echo "Pub/Sub subscription already exists."
 fi
 
-# 5. Install Python dependencies
+# 6. Install Python dependencies
 echo "Installing Python dependencies..."
 uv sync
 
-# 6. Build package wheel for Dataflow workers
+# 7. Build package wheel for Dataflow workers
 echo "Building package wheel for Dataflow workers..."
 uv build --wheel
 WHEEL_FILE=$(ls -t dist/*.whl | head -1)
 echo "Built wheel: ${WHEEL_FILE}"
 
-# 7. Submit pipeline to Dataflow
+# 8. Submit pipeline to Dataflow
 echo ""
 echo "Submitting pipeline to Dataflow with Runner V2..."
 uv run python -m dataflow_pubsub_to_bq.pipeline \
