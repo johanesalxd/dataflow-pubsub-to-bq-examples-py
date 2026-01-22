@@ -6,6 +6,7 @@ Apache Beam pipelines (Python & Java) that read taxi ride data from Google Cloud
 
 ```
 Pub/Sub (taxirides-realtime) -> Dataflow Pipeline -> BigQuery (taxi_events)
+                                                  -> BigQuery DLQ (taxi_events_dlq) [Error Handling]
 ```
 
 ## Features
@@ -34,6 +35,15 @@ dataflow-pubsub-to-bq-examples-py/
 ├── java/                       # Java implementation
 │   ├── pom.xml
 │   └── src/
+│       ├── main/java/com/johanesalxd/
+│       │   ├── PubSubToBigQueryJson.java
+│       │   ├── transforms/
+│       │   └── schemas/
+│       └── test/java/com/johanesalxd/transforms/
+│           └── PubsubMessageToRawJsonTest.java
+├── tests/                      # Unit tests
+│   ├── test_json_to_tablerow.py
+│   └── test_raw_json.py
 └── dataflow_pubsub_to_bq/
     ├── __init__.py
     ├── pipeline.py             # Main pipeline code (Flattened)
@@ -69,6 +79,7 @@ The pipeline reads taxi ride events from the public Pub/Sub topic with this stru
 subscription_name: STRING
 message_id: STRING
 publish_time: TIMESTAMP (partitioned, clustered)
+processing_time: TIMESTAMP
 ride_id: STRING
 point_idx: INT64
 latitude: FLOAT
@@ -136,7 +147,7 @@ mvn -f java/pom.xml test
 The Python pipeline relies on external infrastructure management for table creation.
 - **Tables must be pre-created:** The pipeline uses `CREATE_NEVER` disposition.
 - **Reason:** The Python SDK's BigQueryIO connector has validation limitations with the `JSON` column type in schema definitions.
-- **Automation:** The provided `run_dataflow_json.sh` script handles the creation of both the main table (with `JSON` payload column) and the partitioned Dead Letter Queue (DLQ) table.
+- **Automation:** The provided scripts (`run_dataflow.sh` and `run_dataflow_json.sh`) handle the creation of the main table and the partitioned Dead Letter Queue (DLQ) table.
 
 ### Java Implementation
 The Java pipeline supports both methods:

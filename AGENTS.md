@@ -106,12 +106,18 @@ dataflow-pubsub-to-bq-examples-py/
 │   ├── pipeline_json.py        # Entry point (JSON)
 │   ├── pipeline_options.py     # Options configuration
 │   └── transforms/             # Custom Beam PTransforms
+├── tests/                      # [Python] Unit Tests
+│   ├── test_json_to_tablerow.py
+│   └── test_raw_json.py
 ├── java/                       # [Java] Project Root
 │   ├── pom.xml                 # Maven configuration
-│   └── src/main/java/com/johanesalxd/
-│       ├── PubSubToBigQueryJson.java  # Entry point
-│       ├── transforms/         # Java Transforms
-│       └── schemas/            # BigQuery Schemas
+│   └── src/
+│       ├── main/java/com/johanesalxd/
+│       │   ├── PubSubToBigQueryJson.java
+│       │   ├── transforms/
+│       │   └── schemas/
+│       └── test/java/com/johanesalxd/transforms/
+│           └── PubsubMessageToRawJsonTest.java
 ├── run_dataflow.sh             # [Python] Execution script (Standard)
 ├── run_dataflow_json.sh        # [Python] Execution script (JSON)
 ├── run_dataflow_json_java.sh   # [Java] Execution script

@@ -91,4 +91,35 @@ public class PubsubMessageToRawJsonTest {
 
     pipeline.run();
   }
+
+  @Test
+  public void testProcessPreservesRawFormatting() {
+    // JSON with irregular whitespace (valid)
+    String rawPayload = "{\"ride_id\":   \"123\", \"passenger_count\":\n 1}";
+    PubsubMessage message = new PubsubMessage(
+        rawPayload.getBytes(StandardCharsets.UTF_8),
+        Collections.singletonMap("source", "test")
+    );
+
+    PCollectionTuple results = pipeline
+        .apply(Create.of(message))
+        .apply(ParDo.of(new PubsubMessageToRawJson("projects/test/subscriptions/sub"))
+            .withOutputTags(PubsubMessageToRawJson.SUCCESS_TAG, 
+                TupleTagList.of(PubsubMessageToRawJson.DLQ_TAG)));
+
+    PCollection<TableRow> success = results.get(PubsubMessageToRawJson.SUCCESS_TAG);
+
+    PAssert.that(success).satisfies(rows -> {
+      TableRow row = rows.iterator().next();
+      // Check success output matches RAW string exactly (no normalization/re-serialization)
+      if (!row.get("payload").equals(rawPayload)) {
+        throw new AssertionError(
+            String.format("Payload mismatch. Expected: '%s', Got: '%s'", rawPayload, row.get("payload"))
+        );
+      }
+      return null;
+    });
+
+    pipeline.run();
+  }
 }
