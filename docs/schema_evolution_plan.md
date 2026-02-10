@@ -602,47 +602,63 @@ The Phase 2 demonstration tells a clear governance story in four acts:
 
 4. **Mixed traffic (Step 4):** Start the v2 mirror publisher. Both v1 and v2 messages
    coexist on the schema topic. The pipeline processes both. Query BQ to see mixed rows
-   with `schema_revision_id` distinguishing v1 from v2, and v2 rows having populated
-   `enrichment_timestamp` and `region` columns while v1 rows have NULLs.
+   using `enrichment_timestamp IS NOT NULL` to distinguish v2 (enriched) from v1 (plain)
+   messages. v2 rows have populated `enrichment_timestamp` and `region` columns while
+   v1 rows have NULLs. See [Schema Revision ID Behavior](#schema-revision-id-behavior)
+   for why `schema_revision_id` does not reliably differentiate the two.
 
 ### Validation Queries
 
-After the pipeline processes mixed messages, run these queries to verify:
+After the pipeline processes mixed v1/v2 messages, run these queries to verify. The
+queries use `enrichment_timestamp IS NOT NULL` as the v1/v2 discriminator -- see
+[Schema Revision ID Behavior](#schema-revision-id-behavior) for why `schema_revision_id`
+does not reliably distinguish the two.
 
 ```sql
--- Count messages by schema revision
+-- 1. Mixed traffic overview: count v1 vs v2 messages
 SELECT
-  schema_revision_id,
-  COUNT(*) as message_count,
-  MIN(publish_time) as first_seen,
-  MAX(publish_time) as last_seen
-FROM `${PROJECT_ID}.${DATASET}.${TABLE}`
-GROUP BY schema_revision_id
-ORDER BY first_seen;
+  CASE WHEN enrichment_timestamp IS NOT NULL THEN 'v2 (enriched)' ELSE 'v1 (plain)' END AS schema_version,
+  COUNT(*) AS message_count,
+  COUNT(DISTINCT ride_id) AS unique_rides,
+  MIN(publish_time) AS first_seen,
+  MAX(publish_time) AS last_seen
+FROM `your-project-id.demo_dataset.taxi_events_schema`
+GROUP BY schema_version;
 ```
 
 ```sql
--- Show v2 enrichment fields are populated, v1 has NULLs
+-- 2. Sample v1 and v2 rows side by side
 SELECT
-  schema_revision_id,
-  ride_id,
-  enrichment_timestamp,
-  region,
-  CASE WHEN enrichment_timestamp IS NOT NULL THEN 'v2' ELSE 'v1' END as schema_version
-FROM `${PROJECT_ID}.${DATASET}.${TABLE}`
+  CASE WHEN enrichment_timestamp IS NOT NULL THEN 'v2' ELSE 'v1' END AS version,
+  ride_id, ride_status, latitude,
+  enrichment_timestamp, region, publish_time
+FROM `your-project-id.demo_dataset.taxi_events_schema`
 ORDER BY publish_time DESC
 LIMIT 20;
 ```
 
 ```sql
--- Verify no data loss during transition
+-- 3. Per-minute v1/v2 mix timeline
 SELECT
-  DATE(publish_time) as day,
-  schema_revision_id,
-  COUNT(*) as count
-FROM `${PROJECT_ID}.${DATASET}.${TABLE}`
-GROUP BY day, schema_revision_id
-ORDER BY day DESC, schema_revision_id;
+  TIMESTAMP_TRUNC(publish_time, MINUTE) AS minute,
+  COUNTIF(enrichment_timestamp IS NOT NULL) AS v2_count,
+  COUNTIF(enrichment_timestamp IS NULL) AS v1_count,
+  COUNT(*) AS total
+FROM `your-project-id.demo_dataset.taxi_events_schema`
+GROUP BY minute
+ORDER BY minute DESC
+LIMIT 15;
+```
+
+```sql
+-- 4. v2 region distribution
+SELECT
+  region,
+  COUNT(*) AS count
+FROM `your-project-id.demo_dataset.taxi_events_schema`
+WHERE enrichment_timestamp IS NOT NULL
+GROUP BY region
+ORDER BY count DESC;
 ```
 
 ## Schema Governance Enforcement
@@ -751,17 +767,50 @@ the pipeline (Steps 1-3), the v2 messages **are accepted** by the topic but the 
 the JSON payload but the DoFn's field loop only iterates over the 9 v1 field names. The
 new fields are silently lost -- they pass through Pub/Sub but never reach BigQuery.
 
-Additionally, without Step 2, all messages (including v2) are validated against v1 only
-and stamped with the v1 `googclient_schemarevisionid`. After Step 2, v2 messages are
-validated against the v2 revision and stamped with the v2 revision ID, enabling proper
-version tracking in BigQuery.
+Additionally, without Step 2, the topic only allows the v1 revision. After Step 2, the
+topic accepts messages matching any revision in the v1-to-v2 range. In practice, due to
+Avro's forward/backward compatibility, Pub/Sub may stamp all messages with the same
+revision ID regardless of which fields are present (see
+[Schema Revision ID Behavior](#schema-revision-id-behavior)). The primary value of Step 2
+is formally declaring v2 as an accepted schema revision -- governance, not stamping.
 
 This ordering ensures:
 
 1. **Schema governance**: The v2 revision is explicitly declared and authorized.
 2. **Complete extraction**: The pipeline has the v2 field list and extracts all 11 fields.
-3. **Accurate tracking**: Each message's `schema_revision_id` reflects the actual revision
-   it was validated against.
+3. **Governance audit trail**: Each message's `schema_revision_id` confirms that schema
+   governance was active at publish time. While it may not differentiate v1 from v2 in
+   practice (see [Schema Revision ID Behavior](#schema-revision-id-behavior)), it proves
+   the message was validated against a known revision.
+
+### Schema Revision ID Behavior
+
+During live testing with mixed v1/v2 traffic, all messages received the **same
+`schema_revision_id`** (the v1 revision ID) -- even after committing the v2 revision,
+updating the topic's revision range, and restarting the pipeline.
+
+**Why this happens:** Pub/Sub evaluates schema revisions from newest to oldest and stamps
+the message with the first matching revision. Because v2 adds only nullable fields with
+defaults, both v1 and v2 messages are valid against **both** revisions under Avro's
+forward/backward compatibility rules. Pub/Sub may consistently match one revision for all
+messages regardless of which fields are present. This is server-side Pub/Sub behavior, not
+a pipeline code issue.
+
+**Practical consequence:** `schema_revision_id` cannot be used to distinguish v1 from v2
+messages. The reliable discriminator is `enrichment_timestamp IS NOT NULL`:
+
+- **v1 messages:** `enrichment_timestamp` is `NULL` (field not present in payload, stored
+  as NULL via `.get()` default).
+- **v2 messages:** `enrichment_timestamp` is populated by the SMT with an ISO 8601 timestamp.
+
+**What `schema_revision_id` still tells you:**
+
+- Schema governance is active -- the field is populated on every message.
+- The message was validated against a known schema revision at publish time.
+- The schema name (`googclient_schemaname`) confirms which schema resource was used.
+
+The validation queries in this document use `enrichment_timestamp IS NOT NULL` as the v1/v2
+discriminator based on this observed behavior.
 
 ## Key Design Decisions
 

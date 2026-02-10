@@ -13,7 +13,7 @@
 #   5. BigQuery table
 #
 # Resources NOT deleted (shared across all 3 pipelines):
-#   - GCS bucket (gs://johanesa-playground-326616-dataflow-bucket)
+#   - GCS bucket (gs://${PROJECT_ID}-dataflow-bucket)
 #   - BigQuery dataset (demo_dataset)
 #
 # Usage:
@@ -23,7 +23,7 @@
 set -e
 
 # --- Configuration (must match run_dataflow_schema_driven.sh) ---
-PROJECT_ID="johanesa-playground-326616"
+PROJECT_ID="your-project-id"
 REGION="us-central1"
 BIGQUERY_DATASET="demo_dataset"
 BIGQUERY_TABLE="taxi_events_schema"

@@ -127,7 +127,33 @@ The pipeline fetches an Avro schema from the Pub/Sub Schema Registry at startup 
 
 **When to use:** When schema governance is a requirement (multi-team environments, regulatory compliance), when you need publish-time validation to guarantee data quality, or when you want automatic schema evolution without code changes but prefer typed BigQuery columns over raw JSON.
 
-For detailed design, schema evolution strategy (v1 to v2), and architecture decisions, see [docs/schema_evolution_plan.md](docs/schema_evolution_plan.md).
+**Verifying Mixed v1/v2 Traffic:**
+
+After running the schema evolution demo (v1 + v2 mirror publishers), query BigQuery to confirm both message types are flowing. Use `enrichment_timestamp IS NOT NULL` to distinguish v2 (enriched) from v1 (plain) messages:
+
+```sql
+-- Mixed traffic overview
+SELECT
+  CASE WHEN enrichment_timestamp IS NOT NULL THEN 'v2 (enriched)' ELSE 'v1 (plain)' END AS schema_version,
+  COUNT(*) AS message_count,
+  COUNT(DISTINCT ride_id) AS unique_rides
+FROM `your-project-id.demo_dataset.taxi_events_schema`
+GROUP BY schema_version;
+```
+
+```sql
+-- Per-minute v1/v2 timeline
+SELECT
+  TIMESTAMP_TRUNC(publish_time, MINUTE) AS minute,
+  COUNTIF(enrichment_timestamp IS NOT NULL) AS v2_count,
+  COUNTIF(enrichment_timestamp IS NULL) AS v1_count
+FROM `your-project-id.demo_dataset.taxi_events_schema`
+GROUP BY minute
+ORDER BY minute DESC
+LIMIT 15;
+```
+
+For the full set of validation queries and details on schema revision ID behavior, see [docs/schema_evolution_plan.md](docs/schema_evolution_plan.md).
 
 ## Input Data Format
 

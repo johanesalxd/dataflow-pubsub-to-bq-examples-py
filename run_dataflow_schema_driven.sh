@@ -11,9 +11,9 @@
 set -e
 
 # --- Configuration ---
-PROJECT_ID="johanesa-playground-326616"
+PROJECT_ID="your-project-id"
 REGION="us-central1"
-TEMP_BUCKET="gs://johanesa-playground-326616-dataflow-bucket"
+TEMP_BUCKET="gs://${PROJECT_ID}-dataflow-bucket"
 BIGQUERY_DATASET="demo_dataset"
 BIGQUERY_TABLE="taxi_events_schema"
 SCHEMA_NAME="taxi-ride-schema"

@@ -20,7 +20,7 @@
 set -e
 
 # --- Configuration (must match run_dataflow_schema_driven.sh) ---
-PROJECT_ID="johanesa-playground-326616"
+PROJECT_ID="your-project-id"
 REGION="us-central1"
 SCHEMA_NAME="taxi-ride-schema"
 SCHEMA_TOPIC="taxi_telemetry_schema"
