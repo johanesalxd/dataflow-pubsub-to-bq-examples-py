@@ -6,6 +6,7 @@ import apache_beam as beam
 from apache_beam.io.gcp.pubsub import PubsubMessage
 from apache_beam.testing.test_pipeline import TestPipeline
 from apache_beam.testing.util import assert_that
+from apache_beam.utils.timestamp import Timestamp
 
 from dataflow_pubsub_to_bq.transforms.schema_driven_to_tablerow import (
     ParseSchemaDrivenMessage,
@@ -74,7 +75,7 @@ V2_SCHEMA = json.dumps(
 
 def test_avro_to_bq_schema_v1():
     """Tests that v1 Avro schema produces 9 fields with correct BQ types."""
-    bq_fields, field_names = avro_to_bq_schema(V1_SCHEMA)
+    bq_fields, field_names, timestamp_fields = avro_to_bq_schema(V1_SCHEMA)
 
     assert len(bq_fields) == 9
     assert len(field_names) == 9
@@ -102,10 +103,13 @@ def test_avro_to_bq_schema_v1():
     assert field_map["ride_status"]["type"] == "STRING"
     assert field_map["passenger_count"]["type"] == "INT64"
 
+    # Check timestamp fields
+    assert timestamp_fields == {"timestamp"}
+
 
 def test_avro_to_bq_schema_v2():
     """Tests that v2 Avro schema produces 11 fields including nullable types."""
-    bq_fields, field_names = avro_to_bq_schema(V2_SCHEMA)
+    bq_fields, field_names, timestamp_fields = avro_to_bq_schema(V2_SCHEMA)
 
     assert len(bq_fields) == 11
     assert len(field_names) == 11
@@ -119,6 +123,9 @@ def test_avro_to_bq_schema_v2():
     assert field_map["enrichment_timestamp"]["mode"] == "NULLABLE"
     assert field_map["region"]["type"] == "STRING"
     assert field_map["region"]["mode"] == "NULLABLE"
+
+    # Both timestamp fields detected
+    assert timestamp_fields == {"timestamp", "enrichment_timestamp"}
 
 
 def test_avro_to_bq_schema_logical_types():
@@ -149,12 +156,13 @@ def test_avro_to_bq_schema_logical_types():
             ],
         }
     )
-    bq_fields, _ = avro_to_bq_schema(schema)
+    bq_fields, _, timestamp_fields = avro_to_bq_schema(schema)
     field_map = {f["name"]: f for f in bq_fields}
 
     assert field_map["ts_millis"]["type"] == "TIMESTAMP"
     assert field_map["ts_micros"]["type"] == "TIMESTAMP"
     assert field_map["d"]["type"] == "DATE"
+    assert timestamp_fields == {"ts_millis", "ts_micros"}
 
 
 def test_avro_to_bq_schema_nullable_union():
@@ -177,13 +185,14 @@ def test_avro_to_bq_schema_nullable_union():
             ],
         }
     )
-    bq_fields, _ = avro_to_bq_schema(schema)
+    bq_fields, _, timestamp_fields = avro_to_bq_schema(schema)
     field_map = {f["name"]: f for f in bq_fields}
 
     assert field_map["optional_str"]["type"] == "STRING"
     assert field_map["optional_str"]["mode"] == "NULLABLE"
     assert field_map["optional_int"]["type"] == "INT64"
     assert field_map["optional_int"]["mode"] == "NULLABLE"
+    assert timestamp_fields == set()
 
 
 def test_envelope_schema():
@@ -226,13 +235,15 @@ def test_parse_valid_v1_message():
         },
     )
 
-    _, field_names = avro_to_bq_schema(V1_SCHEMA)
+    _, field_names, timestamp_fields = avro_to_bq_schema(V1_SCHEMA)
 
     with TestPipeline() as p:
         results = (
             p
             | beam.Create([message])
-            | beam.ParDo(ParseSchemaDrivenMessage("test_sub", field_names))
+            | beam.ParDo(
+                ParseSchemaDrivenMessage("test_sub", field_names, timestamp_fields)
+            )
         )
 
         def check_output(elements):
@@ -248,7 +259,9 @@ def test_parse_valid_v1_message():
             assert row["point_idx"] == 42
             assert row["latitude"] == 40.7128
             assert row["passenger_count"] == 2
-            assert row["timestamp"] == 1736899549168
+            # Timestamp converted from epoch millis to Beam Timestamp
+            expected_ts = Timestamp.of(1736899549168 / 1000.0)
+            assert row["timestamp"] == expected_ts
 
         assert_that(results, check_output)
 
@@ -273,13 +286,15 @@ def test_parse_message_with_missing_optional_fields():
     )
 
     # Use v2 field names (11 fields)
-    _, field_names = avro_to_bq_schema(V2_SCHEMA)
+    _, field_names, timestamp_fields = avro_to_bq_schema(V2_SCHEMA)
 
     with TestPipeline() as p:
         results = (
             p
             | beam.Create([message])
-            | beam.ParDo(ParseSchemaDrivenMessage("test_sub", field_names))
+            | beam.ParDo(
+                ParseSchemaDrivenMessage("test_sub", field_names, timestamp_fields)
+            )
         )
 
         def check_output(elements):
@@ -313,13 +328,15 @@ def test_parse_only_extracts_schema_fields():
         attributes={},
     )
 
-    _, field_names = avro_to_bq_schema(V1_SCHEMA)
+    _, field_names, timestamp_fields = avro_to_bq_schema(V1_SCHEMA)
 
     with TestPipeline() as p:
         results = (
             p
             | beam.Create([message])
-            | beam.ParDo(ParseSchemaDrivenMessage("test_sub", field_names))
+            | beam.ParDo(
+                ParseSchemaDrivenMessage("test_sub", field_names, timestamp_fields)
+            )
         )
 
         def check_output(elements):

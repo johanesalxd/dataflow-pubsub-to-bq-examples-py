@@ -43,8 +43,10 @@ def run(argv=None):
     schema = schema_client.get_schema(request={"name": custom_options.pubsub_schema})
     logging.info("Schema revision: %s", schema.revision_id)
 
-    # Parse Avro schema to generate BQ fields and field names
-    payload_bq_fields, payload_field_names = avro_to_bq_schema(schema.definition)
+    # Parse Avro schema to generate BQ fields, field names, and timestamp fields
+    payload_bq_fields, payload_field_names, timestamp_fields = avro_to_bq_schema(
+        schema.definition
+    )
     logging.info(
         "Payload fields from schema (%d): %s",
         len(payload_field_names),
@@ -70,6 +72,7 @@ def run(argv=None):
                 ParseSchemaDrivenMessage(
                     custom_options.subscription_name,
                     payload_field_names,
+                    timestamp_fields,
                 )
             )
             | "WriteToBigQuery"

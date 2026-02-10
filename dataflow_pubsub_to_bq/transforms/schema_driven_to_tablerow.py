@@ -71,16 +71,19 @@ def _resolve_avro_type(avro_type: str | dict) -> str:
 
 def avro_to_bq_schema(
     avro_definition: str,
-) -> tuple[list[dict[str, str]], list[str]]:
+) -> tuple[list[dict[str, str]], list[str], set[str]]:
     """Parses an Avro schema JSON string and generates BigQuery schema fields.
 
     Args:
         avro_definition: JSON string of the Avro schema definition.
 
     Returns:
-        A tuple of (bq_fields, field_names) where:
+        A tuple of (bq_fields, field_names, timestamp_fields) where:
         - bq_fields: List of BigQuery schema field dicts with name, type, mode.
         - field_names: List of field name strings (in schema order).
+        - timestamp_fields: Set of field names that are TIMESTAMP type.
+            These need conversion from epoch millis/micros to Beam Timestamp
+            objects for Storage Write API compatibility.
 
     Raises:
         ValueError: If the Avro schema contains unsupported types.
@@ -88,6 +91,7 @@ def avro_to_bq_schema(
     schema = json.loads(avro_definition)
     bq_fields: list[dict[str, str]] = []
     field_names: list[str] = []
+    timestamp_fields: set[str] = set()
 
     for field in schema["fields"]:
         name = field["name"]
@@ -108,7 +112,10 @@ def avro_to_bq_schema(
             bq_type = _resolve_avro_type(avro_type)
             bq_fields.append({"name": name, "type": bq_type, "mode": "NULLABLE"})
 
-    return bq_fields, field_names
+        if bq_type == "TIMESTAMP":
+            timestamp_fields.add(name)
+
+    return bq_fields, field_names, timestamp_fields
 
 
 def get_envelope_bigquery_schema() -> list[dict[str, str]]:
@@ -144,16 +151,25 @@ class ParseSchemaDrivenMessage(beam.DoFn):
     to conform to the schema.
     """
 
-    def __init__(self, subscription_name: str, payload_field_names: list[str]):
+    def __init__(
+        self,
+        subscription_name: str,
+        payload_field_names: list[str],
+        timestamp_fields: set[str] | None = None,
+    ):
         """Initializes the transform.
 
         Args:
             subscription_name: Short subscription name for BigQuery metadata.
             payload_field_names: List of field names from the Avro schema.
                 These are extracted dynamically from each message payload.
+            timestamp_fields: Set of field names that are TIMESTAMP type.
+                Values for these fields are converted from epoch milliseconds
+                to Beam Timestamp objects for Storage Write API compatibility.
         """
         self.subscription_name = subscription_name
         self.payload_field_names = payload_field_names
+        self.timestamp_fields = timestamp_fields or set()
 
     def process(self, element: PubsubMessage) -> Any:
         """Processes a single Pub/Sub message.
@@ -199,6 +215,10 @@ class ParseSchemaDrivenMessage(beam.DoFn):
 
         # Dynamic payload fields -- driven by schema
         for field_name in self.payload_field_names:
-            bq_row[field_name] = payload.get(field_name)
+            value = payload.get(field_name)
+            # Convert epoch millis to Beam Timestamp for TIMESTAMP columns
+            if value is not None and field_name in self.timestamp_fields:
+                value = Timestamp.of(value / 1000.0)
+            bq_row[field_name] = value
 
         yield bq_row

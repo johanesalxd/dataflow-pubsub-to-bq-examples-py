@@ -40,7 +40,7 @@ def generate_bq_schema_string(schema_resource_path: str) -> str:
     schema = client.get_schema(request={"name": schema_resource_path})
     logger.info("Schema revision: %s", schema.revision_id)
 
-    payload_fields, field_names = avro_to_bq_schema(schema.definition)
+    payload_fields, field_names, _ = avro_to_bq_schema(schema.definition)
     logger.info("Payload fields (%d): %s", len(field_names), field_names)
 
     envelope_fields = get_envelope_bigquery_schema()
