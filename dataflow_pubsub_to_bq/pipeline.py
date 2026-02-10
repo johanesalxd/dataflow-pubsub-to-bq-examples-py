@@ -35,12 +35,9 @@ def run(argv=None):
         )
 
         # Parse messages and write to BigQuery with Storage Write API
-        rows = (
-            messages
-            | "ParseMessages"
-            >> beam.ParDo(ParsePubSubMessage(custom_options.subscription_name))
-            .with_outputs("dlq", main="success")
-        )
+        rows = messages | "ParseMessages" >> beam.ParDo(
+            ParsePubSubMessage(custom_options.subscription_name)
+        ).with_outputs("dlq", main="success")
 
         (
             rows.success

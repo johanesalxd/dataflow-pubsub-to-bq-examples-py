@@ -33,7 +33,7 @@ def test_process_valid_message():
         "ride_id": "123",
         "passenger_count": 1,
         "ride_status": "enroute",
-        "meter_reading": 15.5
+        "meter_reading": 15.5,
     }
     message = PubsubMessage(
         data=json.dumps(payload).encode("utf-8"), attributes={"source": "test"}

@@ -30,7 +30,6 @@ class ParsePubSubMessage(beam.DoFn):
         """
         self.subscription_name = subscription_name
 
-
     def process(self, element: PubsubMessage) -> Any:
         """Processes a single Pub/Sub message.
 
