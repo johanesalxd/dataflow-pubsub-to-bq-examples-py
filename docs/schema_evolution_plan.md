@@ -198,16 +198,16 @@ list -- the mapping function parses the Avro schema JSON and generates BQ schema
 
 | Avro Type | BQ Type | BQ Mode | Example Fields |
 |---|---|---|---|
-| `"string"` | STRING | REQUIRED | `ride_id`, `ride_status` |
-| `"int"` | INT64 | REQUIRED | `point_idx`, `passenger_count` |
-| `"long"` | INT64 | REQUIRED | |
-| `"float"` | FLOAT64 | REQUIRED | |
-| `"double"` | FLOAT64 | REQUIRED | `latitude`, `meter_reading` |
-| `"boolean"` | BOOL | REQUIRED | |
-| `{"type": "string", "logicalType": "iso-datetime"}` | TIMESTAMP | REQUIRED | `timestamp` |
-| `{"type": "long", "logicalType": "timestamp-millis"}` | TIMESTAMP | REQUIRED | |
-| `{"type": "long", "logicalType": "timestamp-micros"}` | TIMESTAMP | REQUIRED | |
-| `{"type": "int", "logicalType": "date"}` | DATE | REQUIRED | |
+| `"string"` | STRING | NULLABLE | `ride_id`, `ride_status` |
+| `"int"` | INT64 | NULLABLE | `point_idx`, `passenger_count` |
+| `"long"` | INT64 | NULLABLE | |
+| `"float"` | FLOAT64 | NULLABLE | |
+| `"double"` | FLOAT64 | NULLABLE | `latitude`, `meter_reading` |
+| `"boolean"` | BOOL | NULLABLE | |
+| `{"type": "string", "logicalType": "iso-datetime"}` | TIMESTAMP | NULLABLE | `timestamp` |
+| `{"type": "long", "logicalType": "timestamp-millis"}` | TIMESTAMP | NULLABLE | |
+| `{"type": "long", "logicalType": "timestamp-micros"}` | TIMESTAMP | NULLABLE | |
+| `{"type": "int", "logicalType": "date"}` | DATE | NULLABLE | |
 | `["null", "string"]` | STRING | NULLABLE | `region` (v2) |
 | `["null", "int"]` | INT64 | NULLABLE | |
 | `["null", {"type": "string", "logicalType": "iso-datetime"}]` | TIMESTAMP | NULLABLE | `enrichment_timestamp` (v2) |
@@ -307,7 +307,7 @@ At runtime, it:
 1. Decodes message data and parses JSON.
 2. Extracts static envelope fields (subscription metadata, schema governance attributes).
 3. Dynamically extracts all payload fields using a loop over the schema field names:
-   `for field_name in self.payload_field_names: bq_row[field_name] = ride_data.get(field_name)`
+   `for field_name in self.payload_field_names: bq_row[field_name] = payload.get(field_name)`
 
 When the schema evolves from v1 (9 fields) to v2 (11 fields), the same code runs unchanged.
 The DoFn receives `["ride_id", "point_idx", ..., "enrichment_timestamp", "region"]` instead
@@ -380,7 +380,7 @@ Table is partitioned on `publish_time` (DAY) and clustered on `publish_time`.
 | `scripts/enrich_taxi_ride.yaml` | v2 | SMT definition (JavaScript UDF) for v2 enrichment |
 | `scripts/run_schema_evolution.sh` | v2 | Phase 2 orchestration: schema evolution + v2 mirror publisher |
 | `run_dataflow_schema_driven.sh` | v1 | End-to-end deployment script (auto-cancels old job, fetches schema from registry) |
-| `tests/test_schema_driven_to_tablerow.py` | v1 | Unit tests for dynamic extraction and type mapping |
+| `tests/test_schema_driven_to_tablerow.py` | v1+v2 | Unit tests for dynamic extraction and type mapping |
 
 ## Phase 2: Schema v2 Evolution
 
@@ -458,7 +458,7 @@ The schema topic validates the enriched message against the v2 revision.
 ### Steps to Evolve
 
 Execute these steps in order after v1 is proven. The ordering is critical -- see
-[Ordering Dependency](#ordering-dependency) for why steps 1-2 must complete before step 4.
+[Ordering Dependency](#ordering-dependency) for why steps 1-3 must complete before step 4.
 
 #### Step 0: Demonstrate Schema Enforcement (Governance Proof)
 
@@ -517,7 +517,8 @@ gcloud pubsub schemas commit taxi-ride-schema \
 ```
 
 This creates a new revision under the existing schema. Note the revision ID from the output.
-The schema now has two revisions (v1 and v2), but the topic is not yet configured to accept v2.
+The schema now has two revisions (v1 and v2), but the topic is not yet configured to validate
+against v2 (v2 messages are accepted via forward compatibility but stamped with the v1 revision ID).
 
 #### Step 2: Update Topic Revision Range
 
@@ -575,8 +576,8 @@ uv run python scripts/publish_to_schema_topic.py \
     --target-topic=${SCHEMA_TOPIC_NAME}
 ```
 
-**Expected result:** v2 messages now pass validation (because Steps 1-2 expanded the
-revision range). The schema topic receives a mix of v1 (from Sub A publisher) and v2
+**Expected result:** v2 messages now have their fields fully extracted (because Steps 1-3
+ensure correct revision tracking and field extraction). The schema topic receives a mix of v1 (from Sub A publisher) and v2
 (from Sub B publisher) messages. The pipeline processes both -- v1 rows have NULL for
 the new columns, v2 rows have populated values.
 
