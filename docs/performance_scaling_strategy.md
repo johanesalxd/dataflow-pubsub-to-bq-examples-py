@@ -302,6 +302,7 @@ Edit the configuration section at the top of `scripts/run_perf_test.sh`:
 | `CONSUMER_NUM_WORKERS` | `3` | Workers per consumer job |
 | `CONSUMER_MACHINE_TYPE` | `n2-standard-4` | Consumer worker machine type |
 | `PUBLISHER_NUM_WORKERS` | `5` | Workers for the publisher job |
+| `PUBLISHER_MACHINE_TYPE` | `n2-standard-4` | Publisher worker machine type |
 | `NUM_MESSAGES` | `36000000` | Total messages (36M = ~360 GB = ~1 hr at 100 MB/s) |
 | `MESSAGE_SIZE_BYTES` | `10000` | Target size per message in bytes |
 

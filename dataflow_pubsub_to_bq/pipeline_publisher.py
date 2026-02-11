@@ -75,7 +75,7 @@ def generate_batch(
     return result
 
 
-def run_dry_run(num_messages: int, message_size_bytes: int) -> None:
+def run_validate_only(num_messages: int, message_size_bytes: int) -> None:
     """Validates message sizes and reports rate calculations.
 
     Generates sample messages, measures actual sizes, and prints
@@ -165,7 +165,7 @@ def run_dry_run(num_messages: int, message_size_bytes: int) -> None:
 def run(argv: list[str] | None = None):
     """Runs the synthetic data publisher pipeline.
 
-    In dry-run mode, validates message sizes and prints rate estimates
+    In validate-only mode, validates message sizes and prints rate estimates
     without launching a pipeline. Otherwise, generates messages and
     publishes them to the configured Pub/Sub topic via Dataflow.
 
@@ -179,7 +179,7 @@ def run(argv: list[str] | None = None):
     message_size_bytes = custom_options.message_size_bytes
 
     if custom_options.validate_only:
-        run_dry_run(num_messages, message_size_bytes)
+        run_validate_only(num_messages, message_size_bytes)
         return
 
     topic = custom_options.topic
