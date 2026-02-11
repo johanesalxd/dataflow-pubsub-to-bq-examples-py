@@ -4,7 +4,7 @@ Reproducing and diagnosing the "Noisy Neighbor" throughput degradation when mult
 
 ## 1. Problem Statement
 
-A customer runs multiple Kafka-to-BQ Dataflow jobs (Avro, 24 MB/s per topic, ~100 MB/s after decode). A single job writes to BigQuery at 100 MB/s. Adding a second identical job to the same table should give 200 MB/s total, but only 120 MB/s is observed. Both jobs show low CPU and low Dataflow lag -- no errors are visible.
+Consider a streaming architecture with multiple Kafka-to-BQ Dataflow jobs (Avro, 24 MB/s per topic, ~100 MB/s after decode). A single job writes to BigQuery at 100 MB/s. Adding a second identical job to the same table should give 200 MB/s total, but only 120 MB/s is observed. Both jobs show low CPU and low Dataflow lag -- no errors are visible.
 
 **Question:** Is this BQ per-table contention, quota limit, or connection limit?
 
@@ -344,12 +344,12 @@ Edit the configuration section at the top of `scripts/run_perf_test.sh`:
 
 ### Scaling test rounds
 
-| Round | Workers/Job | Consumers | Purpose |
-| :--- | :--- | :--- | :--- |
-| 1 | 3 | 2 | Baseline -- find single-job ceiling |
-| 2 | 10 | 2 | Does throughput scale with workers? |
-| 3 | 3 | 4 | Does throughput degrade with more consumers? |
-| 4 | 20 | 2 | Push toward connection limit (~40 workers x 25 streams = ~1,000) |
+| Round | Workers/Job | Consumers | Purpose | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | 3 | 2 | Baseline -- find single-job ceiling | Done |
+| 2 | 3 | 3 | Does 300 MB/s quota cap combined throughput? | Next |
+| 3 | 3 | 4+ | Further scaling if round 2 doesn't cap | Pending |
+| 4 | 10+ | 2 | Push toward connection limit | Pending |
 
 ## 10. Kafka Migration
 
@@ -362,7 +362,7 @@ To reproduce this test with Kafka instead of Pub/Sub:
 | Message format | JSON string | JSON string or Avro binary |
 | BQ write | Unchanged | Unchanged |
 
-To add Avro encoding (reproducing the customer's 24 MB/s Avro to ~100 MB/s JSON expansion), serialize the `generate_message()` output with `fastavro` in the publisher and add deserialization in the pipeline.
+To add Avro encoding (reproducing a scenario where 24 MB/s of Avro data expands to ~100 MB/s after JSON decode), serialize the `generate_message()` output with `fastavro` in the publisher and add deserialization in the pipeline.
 
 ## References
 
