@@ -7,8 +7,8 @@
 #
 # Resources deleted:
 #   1. Dataflow jobs (cancelled if running)
-#   2. Pub/Sub subscriptions (sub_a, sub_b)
-#   3. Pub/Sub topics (topic_a, topic_b)
+#   2. Pub/Sub subscriptions (perf_test_sub_a, perf_test_sub_b, ...)
+#   3. Pub/Sub topic (perf_test_topic)
 #   4. BigQuery tables (taxi_events_perf, taxi_events_perf_dlq)
 #
 # Resources NOT deleted (shared across pipelines):
@@ -26,10 +26,10 @@ PROJECT_ID="your-project-id"
 REGION="asia-southeast1"
 BIGQUERY_DATASET="demo_dataset_asia"
 BIGQUERY_TABLE="taxi_events_perf"
-TOPIC_A="perf_test_topic_a"
-TOPIC_B="perf_test_topic_b"
-SUB_A="perf_test_sub_a"
-SUB_B="perf_test_sub_b"
+TOPIC="perf_test_topic"
+
+# Consumer labels to clean up (covers a-h)
+LABELS=(a b c d e f g h)
 
 # Full resource paths
 FULL_TABLE="${PROJECT_ID}:${BIGQUERY_DATASET}.${BIGQUERY_TABLE}"
@@ -44,9 +44,9 @@ fi
 echo "=== BQ Throughput Test Cleanup ==="
 echo ""
 echo "This will delete the following resources:"
-echo "  Dataflow jobs:   dataflow-perf-test-* (cancel if running)"
-echo "  Subscriptions:   ${SUB_A}, ${SUB_B}"
-echo "  Topics:          ${TOPIC_A}, ${TOPIC_B}"
+echo "  Dataflow jobs:   dataflow-perf-test-* and dataflow-perf-publisher-*"
+echo "  Subscriptions:   perf_test_sub_{a..h} (if they exist)"
+echo "  Topic:           ${TOPIC}"
 echo "  BigQuery tables: ${FULL_TABLE}"
 echo "                   ${FULL_TABLE}_dlq"
 echo ""
@@ -85,7 +85,7 @@ echo "--- Step 1: Cancel running Dataflow jobs ---"
 JOB_IDS=$(gcloud dataflow jobs list \
     --region="${REGION}" \
     --project="${PROJECT_ID}" \
-    --filter="name~dataflow-perf-test AND state=Running" \
+    --filter="name~dataflow-perf AND state=Running" \
     --format="value(id)" 2>/dev/null || true)
 
 if [[ -n "${JOB_IDS}" ]]; then
@@ -107,28 +107,23 @@ echo ""
 # ===================================================================
 echo "--- Step 2: Delete Pub/Sub subscriptions ---"
 
-delete_if_exists "Subscription" "${SUB_A}" \
-    "gcloud pubsub subscriptions describe ${SUB_A} --project=${PROJECT_ID}" \
-    "gcloud pubsub subscriptions delete ${SUB_A} --project=${PROJECT_ID} --quiet"
-
-delete_if_exists "Subscription" "${SUB_B}" \
-    "gcloud pubsub subscriptions describe ${SUB_B} --project=${PROJECT_ID}" \
-    "gcloud pubsub subscriptions delete ${SUB_B} --project=${PROJECT_ID} --quiet"
+for LABEL in "${LABELS[@]}"; do
+    SUB_NAME="perf_test_sub_${LABEL}"
+    delete_if_exists "Subscription" "${SUB_NAME}" \
+        "gcloud pubsub subscriptions describe ${SUB_NAME} --project=${PROJECT_ID}" \
+        "gcloud pubsub subscriptions delete ${SUB_NAME} --project=${PROJECT_ID} --quiet"
+done
 
 echo ""
 
 # ===================================================================
-# Step 3: Delete Pub/Sub topics
+# Step 3: Delete Pub/Sub topic
 # ===================================================================
-echo "--- Step 3: Delete Pub/Sub topics ---"
+echo "--- Step 3: Delete Pub/Sub topic ---"
 
-delete_if_exists "Topic" "${TOPIC_A}" \
-    "gcloud pubsub topics describe ${TOPIC_A} --project=${PROJECT_ID}" \
-    "gcloud pubsub topics delete ${TOPIC_A} --project=${PROJECT_ID} --quiet"
-
-delete_if_exists "Topic" "${TOPIC_B}" \
-    "gcloud pubsub topics describe ${TOPIC_B} --project=${PROJECT_ID}" \
-    "gcloud pubsub topics delete ${TOPIC_B} --project=${PROJECT_ID} --quiet"
+delete_if_exists "Topic" "${TOPIC}" \
+    "gcloud pubsub topics describe ${TOPIC} --project=${PROJECT_ID}" \
+    "gcloud pubsub topics delete ${TOPIC} --project=${PROJECT_ID} --quiet"
 
 echo ""
 

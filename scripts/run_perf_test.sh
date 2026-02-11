@@ -2,25 +2,25 @@
 
 # BQ Throughput Ceiling Test -- Orchestration Script
 #
-# Proves the "Noisy Neighbor" / "Shared Pipe" ceiling by launching two
+# Proves the "Noisy Neighbor" / "Shared Pipe" ceiling by launching N
 # identical Dataflow jobs that write to the same BigQuery table and
 # observing throughput degradation.
 #
-# Architecture (per job):
-#   Publisher A (10k msgs/sec, ~10KB each)
-#       -> Topic A -> Sub A -> Dataflow Job A (pipeline_json.py)
-#                                   -> BQ: taxi_events_perf (JSON column)
-#   Publisher B (same config)
-#       -> Topic B -> Sub B -> Dataflow Job B (same BQ table)
+# Architecture:
+#   Publisher (Dataflow batch job, auto-terminates)
+#       -> Topic (perf_test_topic)
+#           -> Sub A (perf_test_sub_a) -> Dataflow Job A (pipeline_json.py)
+#           -> Sub B (perf_test_sub_b) -> Dataflow Job B (same BQ table)
+#           -> Sub N ...               -> Dataflow Job N (same BQ table)
 #
 # Usage:
-#   ./scripts/run_perf_test.sh setup         # create GCP resources
-#   ./scripts/run_perf_test.sh publisher-a   # start publisher A (foreground)
-#   ./scripts/run_perf_test.sh publisher-b   # start publisher B (foreground)
-#   ./scripts/run_perf_test.sh job-a         # launch Dataflow Job A
-#   ./scripts/run_perf_test.sh job-b         # launch Dataflow Job B
-#   ./scripts/run_perf_test.sh monitor       # print monitoring URLs
-#   ./scripts/run_perf_test.sh dry-run       # validate message sizes (no GCP)
+#   ./scripts/run_perf_test.sh setup            # create GCP resources
+#   ./scripts/run_perf_test.sh publish           # launch Dataflow publisher
+#   ./scripts/run_perf_test.sh publish-status    # check publisher job status
+#   ./scripts/run_perf_test.sh job a             # launch consumer Job A
+#   ./scripts/run_perf_test.sh job b             # launch consumer Job B
+#   ./scripts/run_perf_test.sh monitor           # print monitoring URLs
+#   ./scripts/run_perf_test.sh dry-run           # validate message sizes
 
 set -e
 
@@ -33,29 +33,28 @@ TEMP_BUCKET="gs://${PROJECT_ID}-dataflow-bucket"
 BIGQUERY_DATASET="demo_dataset_asia"
 BIGQUERY_TABLE="taxi_events_perf"
 
-# Worker configuration (scale: 3, 10, 20)
-NUM_WORKERS=3
-MACHINE_TYPE="n2-standard-4"
+# Number of consumer jobs (subscriptions a, b, c, ...)
+NUM_CONSUMERS=2
 
-# Publisher configuration
-TARGET_MBPS=100
+# Worker configuration
+CONSUMER_NUM_WORKERS=3
+CONSUMER_MACHINE_TYPE="n2-standard-4"
+PUBLISHER_NUM_WORKERS=5
+PUBLISHER_MACHINE_TYPE="n2-standard-4"
+
+# Message configuration
+NUM_MESSAGES=36000000    # 36M msgs = ~360 GB = ~1 hour at 100 MB/s
 MESSAGE_SIZE_BYTES=10000
-DURATION_MINUTES=30
 
 # Topic/subscription names
-TOPIC_A="perf_test_topic_a"
-TOPIC_B="perf_test_topic_b"
-SUB_A="perf_test_sub_a"
-SUB_B="perf_test_sub_b"
+TOPIC="perf_test_topic"
+FULL_TOPIC="projects/${PROJECT_ID}/topics/${TOPIC}"
+
+# Consumer labels (a-h, extend if needed)
+LABELS=(a b c d e f g h)
 
 # Derived values
 FULL_TABLE="${PROJECT_ID}:${BIGQUERY_DATASET}.${BIGQUERY_TABLE}"
-FULL_TOPIC_A="projects/${PROJECT_ID}/topics/${TOPIC_A}"
-FULL_TOPIC_B="projects/${PROJECT_ID}/topics/${TOPIC_B}"
-FULL_SUB_A="projects/${PROJECT_ID}/subscriptions/${SUB_A}"
-FULL_SUB_B="projects/${PROJECT_ID}/subscriptions/${SUB_B}"
-JOB_NAME_A="dataflow-perf-test-a-$(date +%Y%m%d-%H%M%S)"
-JOB_NAME_B="dataflow-perf-test-b-$(date +%Y%m%d-%H%M%S)"
 
 # ===================================================================
 # Functions
@@ -65,17 +64,22 @@ print_config() {
     echo "=== BQ Throughput Ceiling Test ==="
     echo ""
     echo "Configuration:"
-    echo "  Project:          ${PROJECT_ID}"
-    echo "  Region:           ${REGION}"
-    echo "  BQ Table:         ${FULL_TABLE}"
-    echo "  Workers per job:  ${NUM_WORKERS}x ${MACHINE_TYPE}"
-    echo "  Publisher rate:   ${TARGET_MBPS} MB/s per topic"
-    echo "  Message size:     ${MESSAGE_SIZE_BYTES} bytes"
-    echo "  Duration:         ${DURATION_MINUTES} minutes"
+    echo "  Project:            ${PROJECT_ID}"
+    echo "  Region:             ${REGION}"
+    echo "  BQ Table:           ${FULL_TABLE}"
+    echo "  Topic:              ${FULL_TOPIC}"
+    echo "  Consumers:          ${NUM_CONSUMERS}"
+    echo "  Consumer workers:   ${CONSUMER_NUM_WORKERS}x ${CONSUMER_MACHINE_TYPE}"
+    echo "  Publisher workers:  ${PUBLISHER_NUM_WORKERS}x ${PUBLISHER_MACHINE_TYPE}"
+    echo "  Messages:           ${NUM_MESSAGES}"
+    echo "  Message size:       ${MESSAGE_SIZE_BYTES} bytes"
+    echo ""
+    local TOTAL_GB=$(( NUM_MESSAGES * MESSAGE_SIZE_BYTES / 1000000000 ))
+    echo "  Total data:         ~${TOTAL_GB} GB"
     echo ""
     echo "  BQ Storage Write API quota (${REGION}):"
-    echo "    Throughput:     300 MB/s (regional)"
-    echo "    Connections:    1,000 concurrent"
+    echo "    Throughput:       300 MB/s (regional)"
+    echo "    Connections:      1,000 concurrent"
     echo ""
 }
 
@@ -131,33 +135,29 @@ do_setup() {
         echo "   BigQuery DLQ table already exists."
     fi
 
-    # 5. Pub/Sub topics
-    echo "5. Checking Pub/Sub topics..."
-    for TOPIC in "${TOPIC_A}" "${TOPIC_B}"; do
-        if ! gcloud pubsub topics describe "${TOPIC}" --project="${PROJECT_ID}" 2>/dev/null; then
-            echo "   Creating topic: ${TOPIC}"
-            gcloud pubsub topics create "${TOPIC}" --project="${PROJECT_ID}"
-        else
-            echo "   Topic ${TOPIC} already exists."
-        fi
-    done
+    # 5. Pub/Sub topic (single topic)
+    echo "5. Checking Pub/Sub topic..."
+    if ! gcloud pubsub topics describe "${TOPIC}" --project="${PROJECT_ID}" 2>/dev/null; then
+        echo "   Creating topic: ${TOPIC}"
+        gcloud pubsub topics create "${TOPIC}" --project="${PROJECT_ID}"
+    else
+        echo "   Topic ${TOPIC} already exists."
+    fi
 
-    # 6. Pub/Sub subscriptions
-    echo "6. Checking Pub/Sub subscriptions..."
-    create_sub_if_needed() {
-        local SUB_NAME="$1"
-        local TOPIC_PATH="$2"
+    # 6. Pub/Sub subscriptions (one per consumer)
+    echo "6. Checking Pub/Sub subscriptions (${NUM_CONSUMERS} consumers)..."
+    for i in $(seq 0 $((NUM_CONSUMERS - 1))); do
+        local LABEL="${LABELS[$i]}"
+        local SUB_NAME="perf_test_sub_${LABEL}"
         if ! gcloud pubsub subscriptions describe "${SUB_NAME}" --project="${PROJECT_ID}" 2>/dev/null; then
             echo "   Creating subscription: ${SUB_NAME}"
             gcloud pubsub subscriptions create "${SUB_NAME}" \
                 --project="${PROJECT_ID}" \
-                --topic="${TOPIC_PATH}"
+                --topic="${FULL_TOPIC}"
         else
             echo "   Subscription ${SUB_NAME} already exists."
         fi
-    }
-    create_sub_if_needed "${SUB_A}" "${FULL_TOPIC_A}"
-    create_sub_if_needed "${SUB_B}" "${FULL_TOPIC_B}"
+    done
 
     # 7. Build wheel
     echo "7. Building package wheel..."
@@ -169,42 +169,103 @@ do_setup() {
     echo ""
     echo "=== Setup Complete ==="
     echo ""
+    echo "Subscriptions created:"
+    for i in $(seq 0 $((NUM_CONSUMERS - 1))); do
+        echo "  perf_test_sub_${LABELS[$i]}"
+    done
+    echo ""
+    echo "IMPORTANT: All subscriptions must exist BEFORE publishing."
+    echo "If you need more consumers, increase NUM_CONSUMERS and re-run setup."
+    echo ""
     echo "Next steps:"
-    echo "  1. Start publisher:  ./scripts/run_perf_test.sh publisher-a"
-    echo "  2. Launch job:       ./scripts/run_perf_test.sh job-a"
-    echo "  3. Wait 15 min for steady state"
-    echo "  4. Start publisher:  ./scripts/run_perf_test.sh publisher-b"
-    echo "  5. Launch job:       ./scripts/run_perf_test.sh job-b"
-    echo "  6. Monitor:          ./scripts/run_perf_test.sh monitor"
+    echo "  1. Publish:         ./scripts/run_perf_test.sh publish"
+    echo "  2. Check status:    ./scripts/run_perf_test.sh publish-status"
+    echo "  3. Launch Job A:    ./scripts/run_perf_test.sh job a"
+    echo "  4. Wait 10 min for baseline"
+    echo "  5. Launch Job B:    ./scripts/run_perf_test.sh job b"
+    echo "  6. Monitor:         ./scripts/run_perf_test.sh monitor"
     echo ""
 }
 
-do_publisher() {
-    local LABEL="$1"
-    local TOPIC_PATH="$2"
+do_publish() {
+    WHEEL_FILE=$(ls -t dist/*.whl | head -1)
+    if [[ -z "${WHEEL_FILE}" ]]; then
+        echo "ERROR: No wheel file found. Run './scripts/run_perf_test.sh setup' first."
+        exit 1
+    fi
 
-    echo "=== Starting Publisher ${LABEL} ==="
-    echo "  Topic:    ${TOPIC_PATH}"
-    echo "  Rate:     ${TARGET_MBPS} MB/s"
-    echo "  Size:     ${MESSAGE_SIZE_BYTES} bytes/msg"
-    echo "  Duration: ${DURATION_MINUTES} minutes"
+    local JOB_NAME="dataflow-perf-publisher-$(date +%Y%m%d-%H%M%S)"
+    local TOTAL_GB=$(( NUM_MESSAGES * MESSAGE_SIZE_BYTES / 1000000000 ))
+
+    echo "=== Launching Dataflow Publisher ==="
+    echo "  Job name:     ${JOB_NAME}"
+    echo "  Topic:        ${FULL_TOPIC}"
+    echo "  Messages:     ${NUM_MESSAGES}"
+    echo "  Message size: ${MESSAGE_SIZE_BYTES} bytes"
+    echo "  Total data:   ~${TOTAL_GB} GB"
+    echo "  Workers:      ${PUBLISHER_NUM_WORKERS}x ${PUBLISHER_MACHINE_TYPE}"
     echo ""
-    echo "Press Ctrl+C to stop."
+    echo "  This is a BATCH job. It will auto-terminate after publishing."
     echo ""
 
-    uv run python scripts/synthetic_publisher.py \
+    uv run python -m dataflow_pubsub_to_bq.pipeline_publisher \
+        --runner=DataflowRunner \
         --project="${PROJECT_ID}" \
-        --topic="${TOPIC_PATH}" \
-        --target_mbps="${TARGET_MBPS}" \
+        --region="${REGION}" \
+        --job_name="${JOB_NAME}" \
+        --temp_location="${TEMP_BUCKET}/temp" \
+        --staging_location="${TEMP_BUCKET}/staging" \
+        --topic="${FULL_TOPIC}" \
+        --num_messages="${NUM_MESSAGES}" \
         --message_size_bytes="${MESSAGE_SIZE_BYTES}" \
-        --duration_minutes="${DURATION_MINUTES}"
+        --experiments=use_runner_v2 \
+        --sdk_container_image=apache/beam_python3.12_sdk:2.70.0 \
+        --extra_packages="${WHEEL_FILE}" \
+        --machine_type="${PUBLISHER_MACHINE_TYPE}" \
+        --num_workers="${PUBLISHER_NUM_WORKERS}" \
+        --max_num_workers="${PUBLISHER_NUM_WORKERS}"
+
+    echo ""
+    echo "=== Publisher Job Submitted ==="
+    echo ""
+    echo "Check status:"
+    echo "  ./scripts/run_perf_test.sh publish-status"
+    echo ""
+    echo "View job at:"
+    echo "  https://console.cloud.google.com/dataflow/jobs/${REGION}?project=${PROJECT_ID}"
+    echo ""
+}
+
+do_publish_status() {
+    echo "=== Publisher Job Status ==="
+    echo ""
+    gcloud dataflow jobs list \
+        --project="${PROJECT_ID}" \
+        --region="${REGION}" \
+        --filter="name~dataflow-perf-publisher" \
+        --format="table(id,name,state,createTime)" 2>&1
+    echo ""
 }
 
 do_job() {
     local LABEL="$1"
-    local JOB_NAME="$2"
-    local FULL_SUB="$3"
-    local SUB_NAME="$4"
+
+    # Validate label
+    if [[ -z "${LABEL}" ]]; then
+        echo "ERROR: Job label required. Usage: $0 job <a|b|c|d|...>"
+        exit 1
+    fi
+
+    local SUB_NAME="perf_test_sub_${LABEL}"
+    local FULL_SUB="projects/${PROJECT_ID}/subscriptions/${SUB_NAME}"
+    local JOB_NAME="dataflow-perf-test-${LABEL}-$(date +%Y%m%d-%H%M%S)"
+
+    # Verify subscription exists
+    if ! gcloud pubsub subscriptions describe "${SUB_NAME}" --project="${PROJECT_ID}" 2>/dev/null; then
+        echo "ERROR: Subscription ${SUB_NAME} does not exist."
+        echo "       Set NUM_CONSUMERS high enough and re-run setup."
+        exit 1
+    fi
 
     WHEEL_FILE=$(ls -t dist/*.whl | head -1)
     if [[ -z "${WHEEL_FILE}" ]]; then
@@ -212,10 +273,10 @@ do_job() {
         exit 1
     fi
 
-    echo "=== Launching Dataflow Job ${LABEL} ==="
+    echo "=== Launching Consumer Job ${LABEL^^} ==="
     echo "  Job name:     ${JOB_NAME}"
     echo "  Subscription: ${FULL_SUB}"
-    echo "  Workers:      ${NUM_WORKERS}x ${MACHINE_TYPE}"
+    echo "  Workers:      ${CONSUMER_NUM_WORKERS}x ${CONSUMER_MACHINE_TYPE}"
     echo "  BQ table:     ${FULL_TABLE}"
     echo ""
 
@@ -233,78 +294,92 @@ do_job() {
         --experiments=use_runner_v2 \
         --sdk_container_image=apache/beam_python3.12_sdk:2.70.0 \
         --extra_packages="${WHEEL_FILE}" \
-        --machine_type="${MACHINE_TYPE}" \
-        --num_workers="${NUM_WORKERS}" \
-        --max_num_workers="${NUM_WORKERS}" \
+        --machine_type="${CONSUMER_MACHINE_TYPE}" \
+        --num_workers="${CONSUMER_NUM_WORKERS}" \
+        --max_num_workers="${CONSUMER_NUM_WORKERS}" \
         --enable_streaming_engine
 
     echo ""
-    echo "=== Job ${LABEL} Submitted ==="
+    echo "=== Consumer Job ${LABEL^^} Submitted ==="
     echo ""
     echo "View job at:"
-    echo "  https://console.cloud.google.com/dataflow/jobs/${REGION}/${JOB_NAME}?project=${PROJECT_ID}"
+    echo "  https://console.cloud.google.com/dataflow/jobs/${REGION}?project=${PROJECT_ID}"
     echo ""
 }
 
 do_monitor() {
     print_config
-    echo "--- Monitoring URLs ---"
+    echo "--- Console Links ---"
     echo ""
-    echo "Dataflow Jobs:"
-    echo "  https://console.cloud.google.com/dataflow/jobs?project=${PROJECT_ID}&region=${REGION}"
+    echo "1. Dataflow Jobs:"
+    echo "   https://console.cloud.google.com/dataflow/jobs?project=${PROJECT_ID}&region=${REGION}"
     echo ""
-    echo "BigQuery Table:"
-    echo "  https://console.cloud.google.com/bigquery?project=${PROJECT_ID}&ws=!1m5!1m4!4m3!1s${PROJECT_ID}!2s${BIGQUERY_DATASET}!3s${BIGQUERY_TABLE}"
+    echo "2. Pub/Sub Subscriptions (quickest backlog check):"
+    echo "   https://console.cloud.google.com/cloudpubsub/subscription/list?project=${PROJECT_ID}"
     echo ""
-    echo "--- Key Metrics to Monitor (Cloud Monitoring) ---"
+    echo "3. BigQuery Table:"
+    echo "   https://console.cloud.google.com/bigquery?project=${PROJECT_ID}&ws=!1m5!1m4!4m3!1s${PROJECT_ID}!2s${BIGQUERY_DATASET}!3s${BIGQUERY_TABLE}"
     echo ""
-    echo "1. BQ Storage Write API throughput:"
-    echo "   Metric: bigquerystorage.googleapis.com/write/append_bytes"
-    echo "   Filter: resource.label.project_id = \"${PROJECT_ID}\""
-    echo "   Quota:  AppendBytesThroughputPerProjectRegion"
+    echo "4. BQ Storage Write API Quota (throughput):"
+    echo "   https://console.cloud.google.com/iam-admin/quotas?project=${PROJECT_ID}&metric=bigquerystorage.googleapis.com/write/append_bytes"
+    echo "   Quota name: AppendBytesThroughputPerProjectRegion"
+    echo ""
+    echo "5. BQ Storage Write API Quota (connections):"
+    echo "   https://console.cloud.google.com/iam-admin/quotas?project=${PROJECT_ID}&metric=bigquerystorage.googleapis.com/write/max_active_streams"
+    echo "   Quota name: ConcurrentWriteConnectionsPerProjectRegion (limit: 1,000)"
+    echo ""
+    echo "--- Cloud Monitoring Metrics (Metrics Explorer) ---"
+    echo ""
+    echo "Open Metrics Explorer:"
+    echo "  https://console.cloud.google.com/monitoring/metrics-explorer?project=${PROJECT_ID}"
+    echo ""
+    echo "Search for these metrics:"
+    echo ""
+    echo "1. BQ Storage Write API throughput (bytes written):"
+    echo "   Metric:      bigquerystorage.googleapis.com/write/uploaded_bytes_count"
+    echo "   Aggregation: Sum, 1 minute"
+    echo "   Note:        For Dataflow-specific view, use:"
+    echo "                bigquerystorage.googleapis.com/dataflow_write/uploaded_bytes_count"
     echo ""
     echo "2. BQ concurrent connections:"
-    echo "   Metric: bigquerystorage.googleapis.com/write/max_active_streams"
-    echo "   Quota:  ConcurrentWriteConnectionsPerProjectRegion (limit: 1,000)"
+    echo "   Metric:      bigquerystorage.googleapis.com/write/concurrent_connections"
+    echo "   Aggregation: Sum, 1 minute"
     echo ""
     echo "3. Pub/Sub subscription backlog:"
-    echo "   Metric: pubsub.googleapis.com/subscription/num_undelivered_messages"
-    echo "   Subscriptions: ${SUB_A}, ${SUB_B}"
+    echo "   Metric:      pubsub.googleapis.com/subscription/num_unacked_messages_by_region"
+    echo "   Filter:      subscription_id = perf_test_sub_a, perf_test_sub_b, ..."
     echo ""
-    echo "4. Dataflow worker CPU:"
-    echo "   View in Dataflow job monitoring tab > Worker CPU"
+    echo "--- Dataflow Console (no setup needed) ---"
+    echo ""
+    echo "4. Worker CPU:"
+    echo "   Dataflow > click job > Job Metrics tab > look at CPU Utilization"
     echo ""
     echo "5. BQ write wall time:"
-    echo "   View in Dataflow job > Execution Details > WriteToBigQuery stage"
+    echo "   Dataflow > click job > Execution Details tab > click WriteToBigQuery stage"
     echo ""
     echo "--- What to Look For ---"
     echo ""
     echo "Phase 1 (single job):"
-    echo "  - CPU < 30% = I/O bound (expected)"
-    echo "  - Pub/Sub backlog stable = pipeline keeping up"
-    echo "  - BQ write throughput ~ 100 MB/s"
+    echo "  - Worker CPU < 30% = I/O bound (expected)"
+    echo "  - Pub/Sub backlog stable or near zero = pipeline keeping up"
+    echo "  - BQ write throughput ~ 70 MB/s per job"
     echo ""
     echo "Phase 2 (two jobs, same table):"
-    echo "  - Job A throughput drops after Job B starts = contention"
-    echo "  - Combined < 200 MB/s = shared resource limit"
-    echo "  - Check BQ quota usage: if < 100% = not quota-bound"
-    echo "  - Check connections: if near 1,000 = connection-bound"
-    echo ""
-    echo "--- IAM Quota Check ---"
-    echo ""
-    echo "  https://console.cloud.google.com/iam-admin/quotas?project=${PROJECT_ID}&metric=bigquerystorage.googleapis.com"
+    echo "  - Sub A backlog grows after Job B starts = noisy neighbor confirmed"
+    echo "  - Job A system lag increases = BQ contention slowing pipeline"
+    echo "  - Combined BQ write < 140 MB/s = shared resource limit"
+    echo "  - Quota page shows < 100% usage = not quota-bound (per-table contention)"
+    echo "  - Connections near 1,000 = connection-bound, not throughput-bound"
     echo ""
 }
 
 do_dry_run() {
     echo "=== Dry Run -- Validating Message Sizes ==="
     echo ""
-    uv run python scripts/synthetic_publisher.py \
-        --project="${PROJECT_ID}" \
-        --topic="projects/${PROJECT_ID}/topics/dry-run" \
-        --target_mbps="${TARGET_MBPS}" \
+    uv run python -m dataflow_pubsub_to_bq.pipeline_publisher \
+        --num_messages="${NUM_MESSAGES}" \
         --message_size_bytes="${MESSAGE_SIZE_BYTES}" \
-        --dry-run
+        --validate_only
 }
 
 # ===================================================================
@@ -317,17 +392,14 @@ case "${COMMAND}" in
     setup)
         do_setup
         ;;
-    publisher-a)
-        do_publisher "A" "${FULL_TOPIC_A}"
+    publish)
+        do_publish
         ;;
-    publisher-b)
-        do_publisher "B" "${FULL_TOPIC_B}"
+    publish-status)
+        do_publish_status
         ;;
-    job-a)
-        do_job "A" "${JOB_NAME_A}" "${FULL_SUB_A}" "${SUB_A}"
-        ;;
-    job-b)
-        do_job "B" "${JOB_NAME_B}" "${FULL_SUB_B}" "${SUB_B}"
+    job)
+        do_job "${2}"
         ;;
     monitor)
         do_monitor
@@ -336,25 +408,25 @@ case "${COMMAND}" in
         do_dry_run
         ;;
     *)
-        echo "Usage: $0 {setup|publisher-a|publisher-b|job-a|job-b|monitor|dry-run}"
+        echo "Usage: $0 {setup|publish|publish-status|job <label>|monitor|dry-run}"
         echo ""
         echo "Commands:"
-        echo "  setup        Create all GCP resources (topics, subs, BQ table)"
-        echo "  publisher-a  Start synthetic publisher for Topic A (foreground)"
-        echo "  publisher-b  Start synthetic publisher for Topic B (foreground)"
-        echo "  job-a        Launch Dataflow Job A (reads Sub A, writes to BQ)"
-        echo "  job-b        Launch Dataflow Job B (reads Sub B, same BQ table)"
-        echo "  monitor      Print monitoring URLs and metric names"
-        echo "  dry-run      Validate message sizes without publishing"
+        echo "  setup            Create all GCP resources (topic, subs, BQ table)"
+        echo "  publish          Launch Dataflow publisher (batch, auto-terminates)"
+        echo "  publish-status   Check publisher job status"
+        echo "  job <label>      Launch consumer Job <label> (e.g., job a, job b)"
+        echo "  monitor          Print monitoring URLs and metric names"
+        echo "  dry-run          Validate message sizes without publishing"
         echo ""
         echo "Typical workflow:"
         echo "  1. ./scripts/run_perf_test.sh setup"
-        echo "  2. ./scripts/run_perf_test.sh publisher-a   # terminal 1"
-        echo "  3. ./scripts/run_perf_test.sh job-a          # terminal 2"
-        echo "  4. Wait 15 min for steady state"
-        echo "  5. ./scripts/run_perf_test.sh publisher-b   # terminal 3"
-        echo "  6. ./scripts/run_perf_test.sh job-b          # terminal 4"
+        echo "  2. ./scripts/run_perf_test.sh publish"
+        echo "  3. ./scripts/run_perf_test.sh publish-status  # wait for Done"
+        echo "  4. ./scripts/run_perf_test.sh job a            # Phase 1 baseline"
+        echo "  5. Wait 10 min for steady state"
+        echo "  6. ./scripts/run_perf_test.sh job b            # Phase 2 noisy neighbor"
         echo "  7. ./scripts/run_perf_test.sh monitor"
+        echo "  8. ./scripts/cleanup_perf_test.sh"
         exit 1
         ;;
 esac
