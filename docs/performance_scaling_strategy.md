@@ -1,29 +1,14 @@
-# Dataflow & BigQuery Performance: Scaling, Bottlenecks, and Optimization
+# BQ Throughput Ceiling Test
 
-This document summarizes the technical strategy for diagnosing and optimizing Dataflow-to-BigQuery pipelines, specifically addressing the "Noisy Neighbor" theory and the limits of Vertical Scaling.
+Reproducing and diagnosing the "Noisy Neighbor" throughput degradation when multiple Dataflow jobs write to the same BigQuery table.
 
-## 1. The "Noisy Neighbor" Hypothesis
-**Observation:** Job A reaches 100 MBps. Adding Job B causes both to total only 120 MBps (Job A drops to ~60 MBps). No "errors" are visible, and Dataflow lag appears low.
+## 1. Problem
 
-**The Reality:**
-The bottleneck is likely a **shared resource at the BigQuery sink layer**. Candidates include:
-* **Throughput Quota:** All Dataflow jobs in the same project and region share a single Storage Write API throughput quota.
-* **Concurrent Connections:** Each Beam worker opens multiple write streams. Two jobs double the connection count, which may hit the per-project connection limit.
-* **Per-Table Contention:** Two jobs writing to the same table compete for table-level write locks and partition slots.
-* **Backpressure:** When the BigQuery sink is saturated, Dataflow workers self-throttle and stop pulling data from the source. This is why you see **Low CPU** and **Low Dataflow Lag**, while the **Source Lag (Pub/Sub/Kafka)** actually increases.
+A single Dataflow job writes to BigQuery at 100 MB/s. Adding a second identical job should give 200 MB/s total, but only 120 MB/s is observed. Both jobs show low CPU and low Dataflow lag -- no errors are visible. We need to identify the bottleneck.
 
-## 2. Horizontal vs. Vertical Scaling
+## 2. BigQuery Quotas
 
-| Strategy | When it Works | Why it Fails for I/O |
-| :--- | :--- | :--- |
-| **Vertical Scaling** (Bigger Workers) | CPU-intensive logic (complex crypto, heavy parsing). | **I/O Latency:** A bigger CPU doesn't make the network ACK from BigQuery come back faster. |
-| **Horizontal Scaling** (More Workers) | I/O-bound or Latency-bound tasks. | **Quota Caps:** It works until you hit the shared Project-level quota at the Sink. |
-
-**The Proof:** If you increase worker size and CPU utilization drops even lower while lag stays the same, you have a **Wait-State Bottleneck** (I/O).
-
-## 3. BigQuery Storage Write API Limits
-
-Official quotas (source: [BigQuery Quotas](https://cloud.google.com/bigquery/quotas#write-api-limits)):
+Source: [BigQuery Quotas -- Storage Write API](https://cloud.google.com/bigquery/quotas#write-api-limits)
 
 | Resource | Multi-Region (`us`/`eu`) | Regional (e.g., `asia-southeast1`) |
 | :--- | :--- | :--- |
@@ -32,38 +17,24 @@ Official quotas (source: [BigQuery Quotas](https://cloud.google.com/bigquery/quo
 | **CreateWriteStream** | 10,000 streams/hour | 10,000 streams/hour |
 
 **Key details:**
-* Throughput quota is metered on the **destination project** (where the BQ dataset resides), not the client project.
-* Concurrent connections are metered on the **client project** (the project running the Dataflow job).
-* You may not see `429: Quota Exceeded` if the Beam client library is successfully self-throttling via exponential backoff on `RESOURCE_EXHAUSTED` errors.
-* The connection quota can be a hidden bottleneck: each Beam worker may open 10-50 write streams depending on parallelism. Two jobs with 20 workers each could open 400-2,000 streams, approaching or exceeding the 1,000 regional limit.
+* Throughput quota is metered on the **destination project** (where the BQ dataset lives).
+* Concurrent connections are metered on the **client project** (the Dataflow project).
+* When the BQ sink is saturated, Dataflow workers **self-throttle** and stop pulling from Pub/Sub. This causes **low CPU** and **low Dataflow lag**, while the **Pub/Sub backlog grows**. The backpressure is invisible unless you check the source-side metrics.
+* Each Beam worker may open 10-50 write streams. Two jobs with 20 workers each could approach the 1,000 regional connection limit.
 
-## 4. View vs. Materialized View (MV) Optimization
+**Pub/Sub limits relevant to this test:**
+* Max message size: 10 MB.
+* StreamingPull: 10 MB/s per stream. At 100 MB/s, we need at least 10 concurrent pull streams (Beam handles this automatically with multiple workers).
 
-### Standard Views
-* **Pruning:** BigQuery pushes filters (Predicates) down through views to the base table.
-* **Requirement:** Pruning works as long as the partitioning/clustering columns are **not transformed** inside the view (e.g., don't `CAST` or `CONCAT` the partition key).
+## 3. Test Architecture
 
-### Materialized Views
-* **Heavy Lifting:** Use for complex joins/aggregates to pre-compute results.
-* **Clustering:** You can cluster an MV differently than the base table (a "second dimension" for pruning).
-* **Staleness (`max_staleness`):**
-    * **Default:** Always fresh (merges MV with base table delta at query time).
-    * **Staleness Window:** If you set a 30m window, BigQuery skips the base table delta if the MV refresh is recent, saving significant cost/latency.
-
-## 5. Experimental Reproduction Plan
-
-### Goal
-Reproduce the "Noisy Neighbor" throughput degradation in a controlled environment and identify whether the bottleneck is throughput quota, concurrent connections, or per-table contention.
-
-### Architecture
-
-Each job gets its own dedicated topic and subscription. Both jobs write to the **same** BigQuery table to reproduce the production scenario.
+Each job gets its own topic + subscription. Both jobs write to the **same** BigQuery table.
 
 ```
-Publisher A (10k msgs/sec, ~10KB each, 100 MB/s)
+Publisher A (10k msgs/sec, ~10 KB each, 100 MB/s)
     -> Topic A (perf_test_topic_a)
         -> Sub A (perf_test_sub_a)
-            -> Dataflow Job A (pipeline_json.py, N workers)
+            -> Dataflow Job A (pipeline_json.py)
                 -> BQ: demo_dataset_asia.taxi_events_perf
 
 Publisher B (same config)
@@ -72,150 +43,237 @@ Publisher B (same config)
             -> Dataflow Job B (same pipeline, same BQ table)
 ```
 
+### Why This Design
+
+* **`pipeline_json.py`**: Stores the entire payload in a BQ `JSON` column. Minimal CPU overhead isolates the BQ write bottleneck -- we're not testing parsing performance.
+* **Dedicated topic per job**: Mirrors the production Kafka scenario (each job reads from its own topic). The synthetic publisher controls the exact rate per topic.
+* **Same BQ table**: Reproduces the production scenario where jobs compete for the same table.
+
 ### Message Design
 
-* **Pipeline:** `pipeline_json.py` -- stores the entire payload in a BQ `JSON` column. Minimal CPU overhead isolates the BQ write bottleneck.
-* **Message size:** ~10,000 bytes JSON per message (9 taxi ride fields + `_padding` field).
-* **Publish rate:** 10,000 msgs/sec per publisher = 100 MB/s.
-* **BQ row size:** ~10,128 bytes (payload + 128 bytes metadata overhead).
-* **BQ write throughput:** ~101 MB/s per job, ~202 MB/s for two jobs (67% of 300 MB/s regional quota).
-
-The synthetic publisher (`scripts/synthetic_publisher.py`) supports a `--dry-run` mode to validate all size calculations before spending on GCP resources.
-
-### Phased Test Plan
-
-**Phase 1: Baseline (single job, 3 workers)**
-1. Create resources: `./scripts/run_perf_test.sh setup`
-2. Start Publisher A: `./scripts/run_perf_test.sh publisher-a`
-3. Launch Job A: `./scripts/run_perf_test.sh job-a`
-4. Run for 15 minutes. Record: CPU%, BQ write MB/s, Pub/Sub backlog.
-5. Expected: handles 100 MB/s, CPU < 30%.
-
-**Phase 2: Noisy neighbor (two jobs, 3 workers each)**
-1. Start Publisher B: `./scripts/run_perf_test.sh publisher-b`
-2. Launch Job B: `./scripts/run_perf_test.sh job-b`
-3. Monitor: does Job A's throughput drop? What's the combined total?
-4. Check BQ quota usage and concurrent connections.
-
-**Phase 3: Horizontal scaling (10-20 workers)**
-1. Update `NUM_WORKERS` in `run_perf_test.sh` to 10 or 20.
-2. Repeat Phase 1 and Phase 2.
-3. Does throughput scale linearly with workers?
-    * Yes: stream count / parallelism was the Phase 1 bottleneck.
-    * No: BQ quota or per-table contention is the limit.
-
-### Decision Matrix
-
-| Combined Throughput | BQ Quota Usage | Connections | Diagnosis | Action |
-| :--- | :--- | :--- | :--- | :--- |
-| ~200 MB/s | < 100% | < 1,000 | No contention | System works as expected |
-| ~120 MB/s | ~100% | < 1,000 | **Throughput quota** | Request quota increase |
-| ~120 MB/s | < 100% | ~1,000 | **Connection limit** | Request connection increase or use multiplexing |
-| ~120 MB/s | < 100% | < 1,000 | **Per-table contention** | Write to separate tables or use different partitioning |
-
-## 6. Implementation
-
-### Scripts
-
-| Script | Purpose |
+| Parameter | Value |
 | :--- | :--- |
-| `scripts/synthetic_publisher.py` | High-throughput publisher with `--target_mbps`, `--message_size_bytes`, `--dry-run`. Message generation is broker-agnostic. |
-| `scripts/run_perf_test.sh` | Phased orchestration: `setup`, `publisher-a/b`, `job-a/b`, `monitor`, `dry-run`. |
-| `scripts/cleanup_perf_test.sh` | Idempotent teardown of all test resources. |
+| Message size | ~10,000 bytes (9 taxi ride fields + `_padding`) |
+| Publish rate | 10,000 msgs/sec per publisher |
+| Pub/Sub throughput | 100 MB/s per topic |
+| BQ row size | ~10,128 bytes (payload + 128 bytes metadata) |
+| BQ write throughput | ~101 MB/s per job |
+| Two jobs combined | ~202 MB/s (67% of 300 MB/s regional quota) |
 
-### Configuration
+## 4. How to Run
 
-All test parameters are configurable at the top of `run_perf_test.sh`:
+### 4.1 Prerequisites
+
+**Set your project ID** in both scripts:
 
 ```bash
-PROJECT_ID="your-project-id"
-REGION="asia-southeast1"
-BIGQUERY_DATASET="demo_dataset_asia"
-NUM_WORKERS=3              # scale: 3, 10, 20
-TARGET_MBPS=100            # per publisher
-MESSAGE_SIZE_BYTES=10000   # per message (~10 KB)
+# Edit the PROJECT_ID variable at the top of each file:
+#   scripts/run_perf_test.sh
+#   scripts/cleanup_perf_test.sh
 ```
 
-### Dry Run Validation
+Required GCP APIs: Dataflow, Pub/Sub, BigQuery, Cloud Storage.
 
-Before spending on GCP resources, validate the math:
+### 4.2 Validate Sizes (Dry Run)
+
+Run this first. No GCP resources are created, no cost incurred.
 
 ```bash
 ./scripts/run_perf_test.sh dry-run
 ```
 
-This generates 10,000 sample messages and reports:
-* Actual vs target message sizes
-* Required publish rate (msgs/sec)
-* Estimated BQ write throughput (MB/s)
-* Quota usage percentages
+Expected output:
 
-## 7. Monitoring Guide
+```
+=== Dry Run Report ===
+Sample messages generated: 10,000
+Target message size:       10,000 bytes
+Actual message size:       avg=10000, min=10000, max=10000 bytes
+
+At --target_mbps=100.0:
+  Publish rate:            10,000 msgs/sec
+  Pub/Sub throughput:      100.0 MB/s
+  Pub/Sub streams needed:  10 (at 10 MB/s per StreamingPull)
+
+  BQ row size (estimated): 10128 bytes (payload + 128 bytes metadata)
+  BQ write throughput:     101.3 MB/s
+
+  BQ Storage Write API quota usage (per job):
+    Regional (300 MB/s):   33.8%
+    Multi-region (3 GB/s): 3.4%
+
+  Two jobs at this rate:
+    Combined BQ write:     202.6 MB/s
+    Regional quota usage:  67.5%
+
+Sample message validation: OK (valid JSON, all taxi fields present)
+```
+
+Verify the numbers make sense before proceeding.
+
+### 4.3 Setup Resources
+
+Creates GCS bucket, BQ table, Pub/Sub topics, subscriptions, and builds the wheel.
+
+```bash
+./scripts/run_perf_test.sh setup
+```
+
+### 4.4 Phase 1 -- Single Job Baseline
+
+Open **two terminals**. Start the publisher first, then the Dataflow job.
+
+```bash
+# Terminal 1: start publishing to Topic A
+./scripts/run_perf_test.sh publisher-a
+
+# Terminal 2: launch Dataflow Job A
+./scripts/run_perf_test.sh job-a
+```
+
+Wait **15 minutes** for steady state. Record:
+* Worker CPU % (Dataflow job page)
+* BQ write throughput (Cloud Monitoring)
+* Pub/Sub backlog for `perf_test_sub_a`
+
+**Expected:** ~100 MB/s BQ write, CPU < 30%, backlog stable.
+
+### 4.5 Phase 2 -- Noisy Neighbor
+
+Keep Phase 1 running. Open **two more terminals**.
+
+```bash
+# Terminal 3: start publishing to Topic B
+./scripts/run_perf_test.sh publisher-b
+
+# Terminal 4: launch Dataflow Job B
+./scripts/run_perf_test.sh job-b
+```
+
+Wait **10 minutes**. Observe:
+* Does Job A's throughput drop?
+* What is the combined throughput? (expecting < 200 MB/s if contention exists)
+* Check BQ quota and connection usage (see Section 5)
+
+Print all monitoring URLs:
+
+```bash
+./scripts/run_perf_test.sh monitor
+```
+
+### 4.6 Scaling Up
+
+To test with more workers, clean up the current round and re-run with a new `NUM_WORKERS` value.
+
+```bash
+# 1. Stop publishers (Ctrl+C in terminals 1 and 3)
+# 2. Clean up all resources
+./scripts/cleanup_perf_test.sh --force
+
+# 3. Edit NUM_WORKERS in scripts/run_perf_test.sh
+#    Change: NUM_WORKERS=3  ->  NUM_WORKERS=10
+
+# 4. Re-run from setup
+./scripts/run_perf_test.sh setup
+# Then repeat 4.4 and 4.5
+```
+
+Recommended test rounds:
+
+| Round | Workers per Job | Total Workers | Purpose |
+| :--- | :--- | :--- | :--- |
+| 1 | 3 | 6 | Baseline -- find single-job ceiling with minimal resources |
+| 2 | 10 | 20 | Does throughput scale linearly with workers? |
+| 3 | 20 | 40 | Push toward connection limit (40 workers x ~25 streams = ~1,000) |
+
+### 4.7 Cleanup
+
+Cancels Dataflow jobs, deletes topics, subscriptions, and BQ tables.
+
+```bash
+# Interactive (asks for confirmation)
+./scripts/cleanup_perf_test.sh
+
+# Skip confirmation
+./scripts/cleanup_perf_test.sh --force
+```
+
+## 5. Monitoring
 
 ### Key Metrics
 
-| Metric | Source | What It Tells You |
+| Metric | Where to Find | What It Means |
 | :--- | :--- | :--- |
-| BQ write throughput | `bigquerystorage.googleapis.com/write/append_bytes` | Actual bytes/sec written to BQ |
-| Concurrent connections | `bigquerystorage.googleapis.com/write/max_active_streams` | Number of active write streams |
-| Pub/Sub backlog | `pubsub.googleapis.com/subscription/num_undelivered_messages` | Source lag (growing = backpressure) |
-| Worker CPU | Dataflow job monitoring tab | < 30% = I/O bound |
-| BQ write wall time | Dataflow Execution Details > WriteToBigQuery | Increasing = BQ contention |
+| BQ write throughput | Cloud Monitoring: `bigquerystorage.googleapis.com/write/append_bytes` | Actual bytes/sec written |
+| Concurrent connections | Cloud Monitoring: `bigquerystorage.googleapis.com/write/max_active_streams` | Active write streams |
+| Pub/Sub backlog | Cloud Monitoring: `pubsub.googleapis.com/subscription/num_undelivered_messages` | Growing = backpressure |
+| Worker CPU | Dataflow job monitoring tab | < 30% = I/O bound, not compute bound |
+| BQ write wall time | Dataflow > Execution Details > WriteToBigQuery stage | Increasing = BQ contention |
 
 ### Quota Dashboard
-
-Check quota usage during the test:
 
 ```
 https://console.cloud.google.com/iam-admin/quotas?project=PROJECT_ID&metric=bigquerystorage.googleapis.com
 ```
 
 Filter by:
-* `AppendBytesThroughputPerProjectRegion` -- throughput quota
-* `ConcurrentWriteConnectionsPerProjectRegion` -- connection quota
+* `AppendBytesThroughputPerProjectRegion` -- throughput
+* `ConcurrentWriteConnectionsPerProjectRegion` -- connections
 
 ### Interpreting Results
 
 **Healthy (no contention):**
-* Pub/Sub backlog: stable (near zero)
-* Worker CPU: 10-30%
-* BQ throughput: ~100 MB/s per job, scales linearly with jobs
+* Pub/Sub backlog stable, CPU 10-30%, BQ throughput ~100 MB/s per job, scales linearly.
 
 **Backpressure (BQ-side bottleneck):**
-* Pub/Sub backlog: growing
-* Worker CPU: low (< 20%) -- workers are waiting, not computing
-* Dataflow system lag: low (misleading -- Dataflow doesn't count BQ wait as "lag")
-* BQ write wall time: increasing
+* Pub/Sub backlog growing, CPU low (< 20%), Dataflow system lag low (misleading), BQ write wall time increasing.
 
-## 8. Kafka Migration Notes
+**Key insight:** If CPU is low but lag grows, the bottleneck is I/O, not compute. Bigger workers will not help.
 
-The synthetic publisher is designed to be broker-agnostic. The core functions `generate_message()` and `calculate_rates()` have zero dependency on Pub/Sub and can be reused with any message broker.
+## 6. Decision Matrix
 
-### To Swap to Kafka
+| Combined Throughput | BQ Quota Usage | Connections | Diagnosis | Action |
+| :--- | :--- | :--- | :--- | :--- |
+| ~200 MB/s | < 100% | < 1,000 | No contention | System works as expected |
+| ~120 MB/s | ~100% | < 1,000 | **Throughput quota** | Request quota increase |
+| ~120 MB/s | < 100% | ~1,000 | **Connection limit** | Request connection quota increase or enable multiplexing |
+| ~120 MB/s | < 100% | < 1,000 | **Per-table contention** | Write to separate tables or change partitioning |
 
-1. **Publisher:** Replace `run_publisher()` with a Kafka-specific implementation using `confluent_kafka.Producer`. The `generate_message()` function returns a plain JSON string that works with any producer.
+## 7. Synthetic Publisher Reference
 
-2. **Pipeline:** Replace `ReadFromPubSub` with `ReadFromKafka` in a new pipeline variant. The `WriteToBigQuery` sink configuration is identical regardless of source.
+The publisher can also be invoked directly for advanced use cases.
 
-3. **Avro encoding (optional):** To reproduce the 24 MB/s Avro -> 100 MB/s JSON expansion, add Avro serialization in the publisher and deserialization in the pipeline. The `generate_message()` output can be serialized to Avro using `fastavro`.
+```bash
+uv run python scripts/synthetic_publisher.py \
+    --project=my-project \
+    --topic=projects/my-project/topics/my-topic \
+    --target_mbps=100 \
+    --message_size_bytes=10000 \
+    --duration_minutes=30
+```
 
-### What Changes
-
-| Component | Pub/Sub | Kafka |
+| Flag | Default | Description |
 | :--- | :--- | :--- |
-| Publisher | `google.cloud.pubsub_v1.PublisherClient` | `confluent_kafka.Producer` |
+| `--project` | (required) | GCP project ID |
+| `--topic` | (required) | Full Pub/Sub topic path |
+| `--target_mbps` | `100` | Target publish rate in MB/s |
+| `--message_size_bytes` | `10000` | Target size per message in bytes (min: 250) |
+| `--duration_minutes` | `30` | How long to run (0 = infinite) |
+| `--dry-run` | `false` | Validate sizes and math without publishing |
+
+**Broker-agnostic design:** The `generate_message()` and `calculate_rates()` functions have zero Pub/Sub dependency. They return plain strings and dicts that work with any message broker.
+
+## 8. Kafka Migration
+
+To reproduce this test with Kafka instead of Pub/Sub:
+
+| Component | Pub/Sub (current) | Kafka (swap) |
+| :--- | :--- | :--- |
+| Publisher | `pubsub_v1.PublisherClient` | `confluent_kafka.Producer` |
 | Pipeline source | `ReadFromPubSub(subscription=...)` | `ReadFromKafka(consumer_config=..., topics=...)` |
-| Message format | JSON string (UTF-8 bytes) | JSON string or Avro binary |
+| Message format | JSON string | JSON string or Avro binary |
 | BQ write | Unchanged | Unchanged |
-| Test scripts | `run_perf_test.sh` | New `run_perf_test_kafka.sh` |
+| Message generation | `generate_message()` -- reuse as-is | Same function |
+| Rate calculation | `calculate_rates()` -- reuse as-is | Same function |
 
-### What Stays the Same
-
-* `generate_message()` and `calculate_rates()` -- reusable as-is
-* `WriteToBigQuery` configuration -- identical sink
-* `cleanup_perf_test.sh` -- BQ and Dataflow cleanup is the same
-* All monitoring metrics and quota limits
-
----
-**Conclusion:**
-*"We need to determine whether we are throughput-quota-bound, connection-bound, or table-contention-bound at the BigQuery sink. The test infrastructure supports scaling workers from 3 to 20 and running 1-N concurrent jobs against the same table to isolate the bottleneck. Once identified, the fix is either a quota increase request, connection multiplexing, or table-level sharding."*
+To add Avro encoding (reproducing the 24 MB/s Avro -> 100 MB/s JSON expansion), serialize the `generate_message()` output with `fastavro` in the publisher and add deserialization in the pipeline.
