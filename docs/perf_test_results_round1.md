@@ -15,6 +15,33 @@ Date: 2026-02-11
 | Messages per subscription | 36,000,000 |
 | Message size | ~10,000 bytes |
 | Total data per subscription | ~360 GB |
+| Total data (all subscriptions) | ~720 GB (2 x 360 GB) |
+
+### Sample Row
+
+Each row written to BigQuery has the following structure (JSON column contains the full taxi ride payload with padding):
+
+```json
+{
+  "subscription_name": "perf_test_sub_a",
+  "message_id": "17948491571888611",
+  "publish_time": "2026-02-11 08:50:14",
+  "processing_time": "2026-02-11 09:32:47",
+  "attributes": "{}",
+  "payload": {
+    "ride_id": "ride-303253",
+    "ride_status": "enroute",
+    "latitude": 1.333409,
+    "longitude": 103.912019,
+    "passenger_count": 6,
+    "meter_reading": 16.21,
+    "meter_increment": 0.0105,
+    "point_idx": 1961,
+    "timestamp": "2026-02-27T13:10:07.194087+08:00",
+    "_padding": "oblijtlglaikebrlt...(~9,500 chars of random padding to reach ~10 KB)"
+  }
+}
+```
 
 ### Dataflow Jobs
 
@@ -249,6 +276,27 @@ filter=metric.type%3D%22pubsub.googleapis.com%2Fsubscription%2Fbacklog_bytes%22\
 | `perf_test_sub_a` | 359.9 GB |
 | `perf_test_sub_b` | 359.4 GB |
 
+### Quota Verification
+
+**Query:**
+
+```bash
+gcloud alpha services quota list \
+  --service=bigquerystorage.googleapis.com \
+  --consumer="projects/johanesa-playground-326616" \
+  --filter="append_bytes"
+```
+
+**Result:**
+
+| Quota | Metric | Limit | Effective MB/s |
+|:---|:---|---:|---:|
+| US multi-region | `write/append_bytes` | 193,273,528,320 bytes/min | ~3,221 MB/s |
+| EU multi-region | `write/append_bytes_eu` | 193,273,528,320 bytes/min | ~3,221 MB/s |
+| Regional (asia-southeast1) | `write/append_bytes_region` | 18,874,368,000 bytes/min | ~314.6 MB/s |
+
+The documented quota of "300 MB/s in regions" corresponds to an actual enforced limit of **~314.6 MB/s** (18,874,368,000 bytes/min).
+
 ## Analysis
 
 ### Phase 1: Job A Alone (09:04 - 09:17)
@@ -284,13 +332,6 @@ filter=metric.type%3D%22pubsub.googleapis.com%2Fsubscription%2Fbacklog_bytes%22\
 
 5. **72M total rows written.** All 36M messages from each subscription were successfully written to BigQuery with zero errors.
 
-## Next Step: Round 2 (3-Job Test)
+## Next: Round 2 (3-Job Quota Test)
 
-The 2-job test shows linear scaling at ~330 MB/s combined, which already exceeds the documented 300 MB/s regional quota. To determine whether the quota is enforced as a hard cap, the next test will run 3 concurrent jobs:
-
-- 3 jobs x ~160 MB/s = ~480 MB/s expected demand
-- If throughput caps at ~300-330 MB/s: the quota is enforced (soft or hard)
-- If throughput continues to scale: the quota has significant headroom in this region
-- If errors appear: hard enforcement with rejection
-
-Configuration change: `NUM_CONSUMERS=3` in `scripts/run_perf_test.sh`.
+Round 2 added a third concurrent job to determine whether the ~300 MB/s regional quota is enforced. With 3 jobs demanding ~480 MB/s, BQ exhibited sawtooth throttling (burst/throttle cycles), confirming that the quota is enforced above ~314 MB/s. However, since the production workload (~200 MB/s combined) is well below this threshold, the quota does not explain the production issue. Combined with round 1's proof of linear scaling at ~330 MB/s, **Dataflow and BigQuery are cleared as the bottleneck** -- the problem is upstream. See [Round 2 results](perf_test_results_round2.md).

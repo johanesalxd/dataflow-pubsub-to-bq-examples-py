@@ -12,6 +12,8 @@ Consider a streaming architecture with multiple Kafka-to-BQ Dataflow jobs (Avro,
 
 BQ Storage Write API has per-table throughput limits beyond the documented project-level quotas (300 MB/s regional, 1,000 connections). When multiple Dataflow jobs write to the same table, they contend for per-table write bandwidth, causing throughput degradation invisible to standard Dataflow metrics.
 
+**Resolution:** This hypothesis was disproven. Testing confirmed there is **no per-table contention** -- Dataflow and BigQuery scale linearly to the regional throughput quota (~314.6 MB/s). Two jobs writing to the same table achieved ~330 MB/s combined with zero per-job degradation. Since the production workload (~200 MB/s combined) is well below the quota, the bottleneck is **upstream** of Dataflow and BigQuery (e.g., Kafka consumer configuration, Avro deserialization, or pipeline transform logic). See [Round 1 results](perf_test_results_round1.md) and [Round 2 results](perf_test_results_round2.md).
+
 ## 3. BigQuery Storage Write API Quotas
 
 Source: [BigQuery Quotas -- Storage Write API](https://cloud.google.com/bigquery/quotas#write-api-limits)
@@ -52,7 +54,7 @@ Publisher (Dataflow)     │                           │
 
 The consumer pipeline (`pipeline_json.py`) uses `STORAGE_WRITE_API` (exactly-once semantics). This creates application-created streams -- each worker opens multiple dedicated write connections to BigQuery. The number of streams per worker is determined by Beam's auto-sharding and is not explicitly configured.
 
-A follow-up test with `STORAGE_API_AT_LEAST_ONCE` (default stream, shared connections) would isolate whether the stream type drives the contention. With the default stream, all workers append to a single shared stream, resulting in significantly fewer connections.
+**(Optional)** A follow-up test with `STORAGE_API_AT_LEAST_ONCE` (default stream, shared connections) could isolate whether the stream type affects throughput per connection. With the default stream, all workers append to a single shared stream, resulting in significantly fewer connections. Since testing confirmed Dataflow and BigQuery are not the bottleneck, this test is not required to resolve the original problem.
 
 ### Message Design
 
@@ -347,9 +349,11 @@ Edit the configuration section at the top of `scripts/run_perf_test.sh`:
 | Round | Workers/Job | Consumers | Purpose | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | 3 | 2 | Baseline -- find single-job ceiling | Done |
-| 2 | 3 | 3 | Does 300 MB/s quota cap combined throughput? | Next |
-| 3 | 3 | 4+ | Further scaling if round 2 doesn't cap | Pending |
-| 4 | 10+ | 2 | Push toward connection limit | Pending |
+| 2 | 3 | 3 | Does 300 MB/s quota cap combined throughput? | Done |
+| 3 | 3 | 4+ | Further scaling if round 2 doesn't cap | Optional |
+| 4 | 10+ | 2 | Push toward connection limit | Optional |
+
+**Dataflow and BigQuery cleared in rounds 1-2.** Round 1 proved no per-table contention exists (2 jobs scale linearly to ~330 MB/s). Round 2 confirmed quota enforcement exists above ~314 MB/s via sawtooth throttling, but the production workload (~200 MB/s) is well below this threshold. The bottleneck is upstream. Rounds 3-4 are optional. See [Round 1 results](perf_test_results_round1.md) and [Round 2 results](perf_test_results_round2.md).
 
 ## 10. Kafka Migration
 
@@ -363,6 +367,31 @@ To reproduce this test with Kafka instead of Pub/Sub:
 | BQ write | Unchanged | Unchanged |
 
 To add Avro encoding (reproducing a scenario where 24 MB/s of Avro data expands to ~100 MB/s after JSON decode), serialize the `generate_message()` output with `fastavro` in the publisher and add deserialization in the pipeline.
+
+## 11. Conclusion
+
+The original question -- "Is this BQ per-table contention, quota limit, or connection limit?" -- is answered:
+
+**None of the above. Dataflow and BigQuery are not the bottleneck.**
+
+| Hypothesis | Result |
+| :--- | :--- |
+| Per-table contention | Disproven. 2 jobs writing to the same table scale linearly to ~330 MB/s with no per-job degradation (Round 1). |
+| Connection limit | Not reached. 180 connections at peak (18% of 1,000 limit). Not a factor at current scale (Round 2). |
+| Throughput quota | Only triggered above ~314 MB/s. The production workload (~200 MB/s) is well below this limit (Round 1 proved 2 jobs at ~330 MB/s with no throttling). |
+
+The production scenario (2 jobs at ~100 MB/s each, ~120 MB/s combined instead of ~200 MB/s) cannot be explained by any BigQuery or Dataflow limitation. This test demonstrated that a single Dataflow job achieves ~160 MB/s and 2 jobs scale linearly to ~330 MB/s. The production jobs achieving only ~100 MB/s each indicates the bottleneck is **upstream** of Dataflow and BigQuery.
+
+### Secondary Finding: Quota Enforcement Mechanism
+
+Round 2 discovered that when combined demand exceeds ~314 MB/s, BigQuery enforces the regional throughput quota via periodic sawtooth throttling (burst at ~550 MB/s for 5-7 min, then throttle to ~20 MB/s for 2-4 min). This is relevant for future scaling but does not explain the current production issue.
+
+### Recommendations
+
+1. **Investigate the upstream bottleneck.** Each Dataflow job should achieve ~160 MB/s based on this test. The production jobs only achieve ~100 MB/s -- the gap points to Kafka consumer configuration, Avro deserialization overhead, pipeline transform logic, or network constraints.
+2. **Profile the production pipeline** to identify where the ~60 MB/s per-job gap is lost compared to the baseline established in this test.
+3. **Monitor quota usage** with alerts on `bigquerystorage.googleapis.com/write/append_bytes_region` as a best practice.
+4. **Quota increase or multi-region** is only needed if future scaling pushes combined throughput past ~314 MB/s.
 
 ## References
 
