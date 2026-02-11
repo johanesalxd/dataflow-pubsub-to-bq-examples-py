@@ -48,6 +48,12 @@ Publisher (Dataflow)     │                           │
 - **`pipeline_json.py`:** Stores the entire payload in a BQ `JSON` column. Minimal CPU overhead isolates the BQ write bottleneck.
 - **Same BQ table:** Reproduces the production scenario where jobs compete for the same table.
 
+### Write Method
+
+The consumer pipeline (`pipeline_json.py`) uses `STORAGE_WRITE_API` (exactly-once semantics). This creates application-created streams -- each worker opens multiple dedicated write connections to BigQuery. The number of streams per worker is determined by Beam's auto-sharding and is not explicitly configured.
+
+A follow-up test with `STORAGE_API_AT_LEAST_ONCE` (default stream, shared connections) would isolate whether the stream type drives the contention. With the default stream, all workers append to a single shared stream, resulting in significantly fewer connections.
+
 ### Message Design
 
 | Parameter | Value |
@@ -96,6 +102,22 @@ Launches a batch Dataflow job that generates 36M synthetic messages and publishe
 ```
 
 **Important:** All subscriptions must exist before publishing. If you need more consumers, increase `NUM_CONSUMERS` in `run_perf_test.sh` and re-run `setup` before publishing.
+
+After the publisher finishes, verify each subscription received the expected data volume (~360 GB):
+
+```bash
+curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "https://monitoring.googleapis.com/v3/projects/PROJECT_ID/timeSeries?\
+filter=metric.type%3D%22pubsub.googleapis.com%2Fsubscription%2Fbacklog_bytes%22\
+%20AND%20(resource.labels.subscription_id%3D%22perf_test_sub_a%22\
+%20OR%20resource.labels.subscription_id%3D%22perf_test_sub_b%22)\
+&interval.startTime=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)\
+&interval.endTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)\
+&aggregation.alignmentPeriod=60s\
+&aggregation.perSeriesAligner=ALIGN_MEAN"
+```
+
+Each subscription should show ~360,000,000,000 bytes (~360 GB). If significantly less, the publisher may have failed partway through -- check the Dataflow job logs.
 
 ### 5.5 Phase 1 -- Single Job Baseline
 
@@ -193,6 +215,20 @@ filter=metric.type%3D%22pubsub.googleapis.com%2Fsubscription%2Fnum_unacked_messa
 &aggregation.perSeriesAligner=ALIGN_MEAN"
 ```
 
+**Pub/Sub backlog bytes (data volume per subscription, last 30 minutes):**
+
+```bash
+curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "https://monitoring.googleapis.com/v3/projects/PROJECT_ID/timeSeries?\
+filter=metric.type%3D%22pubsub.googleapis.com%2Fsubscription%2Fbacklog_bytes%22\
+%20AND%20(resource.labels.subscription_id%3D%22perf_test_sub_a%22\
+%20OR%20resource.labels.subscription_id%3D%22perf_test_sub_b%22)\
+&interval.startTime=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)\
+&interval.endTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)\
+&aggregation.alignmentPeriod=60s\
+&aggregation.perSeriesAligner=ALIGN_MEAN"
+```
+
 **BQ write throughput (last 30 minutes):**
 
 ```bash
@@ -241,7 +277,7 @@ ORDER BY minute;
 | :--- | :--- | :--- | :--- | :--- |
 | ~200 MB/s (linear) | < 100% | < 1,000 | No contention | System works as expected |
 | ~120 MB/s | ~100% | < 1,000 | **Throughput quota** | Request quota increase |
-| ~120 MB/s | < 100% | ~1,000 | **Connection limit** | Enable multiplexing or request connection quota increase |
+| ~120 MB/s | < 100% | ~1,000 | **Connection limit** | Use `STORAGE_API_AT_LEAST_ONCE` (default stream), request connection quota increase, or enable multiplexing (Java/Go only) |
 | ~120 MB/s | < 100% | < 1,000 | **Per-table contention** | Write to separate tables, change partitioning, or use multi-region |
 
 ## 8. Cost Estimate
@@ -327,3 +363,11 @@ To reproduce this test with Kafka instead of Pub/Sub:
 | BQ write | Unchanged | Unchanged |
 
 To add Avro encoding (reproducing the customer's 24 MB/s Avro to ~100 MB/s JSON expansion), serialize the `generate_message()` output with `fastavro` in the publisher and add deserialization in the pipeline.
+
+## References
+
+- [BigQuery Storage Write API best practices](https://cloud.google.com/bigquery/docs/write-api-best-practices)
+- [Pub/Sub to BigQuery best practices](https://cloud.google.com/dataflow/docs/guides/pubsub-bigquery-best-practices)
+- [Pub/Sub to BigQuery performance benchmarks](https://cloud.google.com/dataflow/docs/guides/pubsub-bigquery-performance)
+- [Write from Dataflow to BigQuery](https://cloud.google.com/dataflow/docs/guides/write-to-bigquery)
+- [BigQuery Storage Write API quotas](https://cloud.google.com/bigquery/quotas#write-api-limits)
