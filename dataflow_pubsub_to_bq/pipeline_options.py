@@ -32,3 +32,10 @@ class PubSubToBigQueryOptions(PipelineOptions):
             required=True,
             help="Subscription name to record in BigQuery metadata",
         )
+        parser.add_argument(
+            "--use_at_least_once",
+            action="store_true",
+            default=False,
+            help="Use at-least-once semantics for BigQuery Storage Write API "
+            "(default: exactly-once)",
+        )

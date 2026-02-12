@@ -26,6 +26,9 @@ def run(argv=None):
     pipeline_options = PipelineOptions(argv)
     custom_options = pipeline_options.view_as(PubSubToBigQueryOptions)
 
+    use_at_least_once = custom_options.use_at_least_once
+    logging.info("BigQuery use_at_least_once: %s", use_at_least_once)
+
     # Create the pipeline
     with beam.Pipeline(options=pipeline_options) as pipeline:
         # Read from Pub/Sub
@@ -49,6 +52,7 @@ def run(argv=None):
                 write_disposition=bigquery.BigQueryDisposition.WRITE_APPEND,
                 create_disposition=bigquery.BigQueryDisposition.CREATE_NEVER,
                 method=bigquery.WriteToBigQuery.Method.STORAGE_WRITE_API,
+                use_at_least_once=use_at_least_once,
                 triggering_frequency=1,
             )
         )
@@ -63,6 +67,7 @@ def run(argv=None):
                 write_disposition=bigquery.BigQueryDisposition.WRITE_APPEND,
                 create_disposition=bigquery.BigQueryDisposition.CREATE_NEVER,
                 method=bigquery.WriteToBigQuery.Method.STORAGE_WRITE_API,
+                use_at_least_once=use_at_least_once,
                 triggering_frequency=1,
             )
         )

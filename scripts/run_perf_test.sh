@@ -43,8 +43,11 @@ PUBLISHER_NUM_WORKERS=5
 PUBLISHER_MACHINE_TYPE="n2-standard-4"
 
 # Message configuration
-NUM_MESSAGES=36000000    # 36M msgs = ~360 GB = ~1 hour at 100 MB/s
-MESSAGE_SIZE_BYTES=10000
+NUM_MESSAGES=400000000   # 400M msgs = ~200 GB = ~20 min at 160 MB/s (500-byte msgs)
+MESSAGE_SIZE_BYTES=500
+
+# BigQuery write semantics: set to true for at-least-once, false for exactly-once
+USE_AT_LEAST_ONCE=true
 
 # Topic/subscription names
 TOPIC="perf_test_topic"
@@ -73,6 +76,7 @@ print_config() {
     echo "  Publisher workers:  ${PUBLISHER_NUM_WORKERS}x ${PUBLISHER_MACHINE_TYPE}"
     echo "  Messages:           ${NUM_MESSAGES}"
     echo "  Message size:       ${MESSAGE_SIZE_BYTES} bytes"
+    echo "  At-least-once:      ${USE_AT_LEAST_ONCE}"
     echo ""
     local TOTAL_GB=$(( NUM_MESSAGES * MESSAGE_SIZE_BYTES / 1000000000 ))
     echo "  Total data:         ~${TOTAL_GB} GB"
@@ -277,6 +281,7 @@ do_job() {
     echo "  Job name:     ${JOB_NAME}"
     echo "  Subscription: ${FULL_SUB}"
     echo "  Workers:      ${CONSUMER_NUM_WORKERS}x ${CONSUMER_MACHINE_TYPE}"
+    echo "  At-least-once: ${USE_AT_LEAST_ONCE}"
     echo "  BQ table:     ${FULL_TABLE}"
     echo ""
 
@@ -297,6 +302,7 @@ do_job() {
         --machine_type="${CONSUMER_MACHINE_TYPE}" \
         --num_workers="${CONSUMER_NUM_WORKERS}" \
         --max_num_workers="${CONSUMER_NUM_WORKERS}" \
+        $( [[ "${USE_AT_LEAST_ONCE}" == "true" ]] && echo "--use_at_least_once" ) \
         --enable_streaming_engine
 
     echo ""
