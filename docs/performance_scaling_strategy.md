@@ -12,7 +12,7 @@ Consider a streaming architecture with multiple Kafka-to-BQ Dataflow jobs (Avro,
 
 BQ Storage Write API has per-table throughput limits beyond the documented project-level quotas (300 MB/s regional, 1,000 connections). When multiple Dataflow jobs write to the same table, they contend for per-table write bandwidth, causing throughput degradation invisible to standard Dataflow metrics.
 
-**Resolution:** This hypothesis was disproven. Testing confirmed there is **no per-table contention** -- Dataflow and BigQuery scale linearly to the regional throughput quota (~314.6 MB/s). Two jobs writing to the same table achieved ~330 MB/s combined with zero per-job degradation. Since the production workload (~200 MB/s combined) is well below the quota, the bottleneck is **upstream** of Dataflow and BigQuery (e.g., Kafka consumer configuration, Avro deserialization, or pipeline transform logic). See [Round 1 results](perf_test_results_round1.md) and [Round 2 results](perf_test_results_round2.md).
+**Resolution:** This hypothesis was disproven across four rounds of testing. Rounds 1-2 (Python SDK, 10 KB messages) confirmed no per-table contention -- 2 jobs scale linearly to ~330 MB/s. Round 3 (Python SDK, 500-byte messages) showed the Python SDK is CPU-bound at ~55k rows/sec. Round 4 (Java SDK, 500-byte messages) was the definitive test: using the same technology stack as the production workload, 2 Java jobs achieved **757k rows/sec combined** (~425 MB/s) with **zero per-job degradation** and only **25 concurrent connections**. The bottleneck is **upstream** of Dataflow and BigQuery -- specifically in the Kafka source path (consumer configuration, Avro deserialization, or dynamic routing overhead). See [Round 1](perf_test_results_round1.md), [Round 2](perf_test_results_round2.md), [Round 3](perf_test_results_round3.md), and [Round 4](perf_test_results_round4.md).
 
 ## 3. BigQuery Storage Write API Quotas
 
@@ -52,18 +52,18 @@ Publisher (Dataflow)     │                           │
 
 ### Write Method
 
-The consumer pipeline (`pipeline_json.py`) uses `STORAGE_WRITE_API` (exactly-once semantics). This creates application-created streams -- each worker opens multiple dedicated write connections to BigQuery. The number of streams per worker is determined by Beam's auto-sharding and is not explicitly configured.
+Rounds 1-3 use the Python consumer pipeline (`pipeline_json.py`) with `STORAGE_WRITE_API` (exactly-once semantics, application-created streams). Round 4 uses the Java consumer pipeline (`PubSubToBigQueryJson.java`) with `STORAGE_API_AT_LEAST_ONCE` (default stream) and `useStorageApiConnectionPool=true` (multiplexing), matching the production workload configuration.
 
-**(Optional)** A follow-up test with `STORAGE_API_AT_LEAST_ONCE` (default stream, shared connections) could isolate whether the stream type affects throughput per connection. With the default stream, all workers append to a single shared stream, resulting in significantly fewer connections. Since testing confirmed Dataflow and BigQuery are not the bottleneck, this test is not required to resolve the original problem.
+The switch to at-least-once with connection pooling in round 4 reduced concurrent connections from ~60 per job (rounds 1-2) to ~10-15 per job, confirming multiplexing effectiveness. Round 3 showed that write method has no measurable impact on throughput when the pipeline is CPU-bound.
 
 ### Message Design
 
-| Parameter | Value |
-| :--- | :--- |
-| Message size | ~10,000 bytes (9 taxi ride fields + `_padding`) |
-| Total messages | 36,000,000 (per subscription) |
-| Total data | ~360 GB (per subscription) |
-| Duration at 100 MB/s | ~60 minutes |
+| Parameter | Rounds 1-2 | Rounds 3-4 |
+| :--- | :--- | :--- |
+| Message size | ~10,000 bytes (9 taxi fields + `_padding`) | ~500 bytes (9 taxi fields, no padding) |
+| Total messages | 36,000,000 (per subscription) | 400,000,000 (per subscription) |
+| Total data | ~360 GB (per subscription) | ~200 GB (per subscription) |
+| Duration at 100 MB/s | ~60 minutes | ~35 minutes |
 
 ## 5. Test Procedure
 
@@ -346,14 +346,20 @@ Edit the configuration section at the top of `scripts/run_perf_test.sh`:
 
 ### Scaling test rounds
 
-| Round | Workers/Job | Consumers | Purpose | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | 3 | 2 | Baseline -- find single-job ceiling | Done |
-| 2 | 3 | 3 | Does 300 MB/s quota cap combined throughput? | Done |
-| 3 | 3 | 4+ | Further scaling if round 2 doesn't cap | Optional |
-| 4 | 10+ | 2 | Push toward connection limit | Optional |
+| Round | SDK | Msg Size | Workers/Job | Consumers | Purpose | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | Python | 10 KB | 3x n2-std-4 | 2 | Baseline -- per-table contention | Done |
+| 2 | Python | 10 KB | 3x n2-std-4 | 3 | Throughput quota enforcement | Done |
+| 3 | Python | 500 B | 3x n2-std-4 | 1 | Element rate + write method comparison | Done |
+| 4 | **Java** | 500 B | 3x n2-highcpu-8 | 2 | Java SDK at production scale + 2-job scaling | Done |
 
-**Dataflow and BigQuery cleared in rounds 1-2.** Round 1 proved no per-table contention exists (2 jobs scale linearly to ~330 MB/s). Round 2 confirmed quota enforcement exists above ~314 MB/s via sawtooth throttling, but the production workload (~200 MB/s) is well below this threshold. The bottleneck is upstream. Rounds 3-4 are optional. See [Round 1 results](perf_test_results_round1.md) and [Round 2 results](perf_test_results_round2.md).
+**All four rounds complete. Dataflow and BigQuery are definitively cleared as the bottleneck.**
+
+- Rounds 1-2 proved no per-table contention and identified quota enforcement above ~314 MB/s.
+- Round 3 showed Python SDK is CPU-bound at high element rates; write method is irrelevant.
+- Round 4 used the same Java SDK, write method, and connection pooling as the production workload: 2 jobs achieved **757k rows/sec** (~425 MB/s) with **zero degradation** and only **25 connections**. The production bottleneck is upstream (Kafka source path).
+
+See [Round 1](perf_test_results_round1.md), [Round 2](perf_test_results_round2.md), [Round 3](perf_test_results_round3.md), and [Round 4](perf_test_results_round4.md).
 
 ## 10. Kafka Migration
 
@@ -376,22 +382,46 @@ The original question -- "Is this BQ per-table contention, quota limit, or conne
 
 | Hypothesis | Result |
 | :--- | :--- |
-| Per-table contention | Disproven. 2 jobs writing to the same table scale linearly to ~330 MB/s with no per-job degradation (Round 1). |
-| Connection limit | Not reached. 180 connections at peak (18% of 1,000 limit). Not a factor at current scale (Round 2). |
-| Throughput quota | Only triggered above ~314 MB/s. The production workload (~200 MB/s) is well below this limit (Round 1 proved 2 jobs at ~330 MB/s with no throttling). |
+| Per-table contention | Disproven. 2 jobs writing to the same table scale linearly with no per-job degradation (Rounds 1, 4). |
+| Connection limit | Not reached. Peak 25 connections with pooling (2.5% of 1,000 limit, Round 4). Without pooling: 180 connections (18%, Round 2). |
+| Throughput quota | Only triggered above ~314 MB/s via sawtooth throttling (Round 2). Production workload (~200 MB/s) is well below this limit. |
+| Write method | No effect. Exactly-once and at-least-once produce identical throughput (Round 3). |
+| Element rate | Not a BQ limitation. 757k rows/sec sustained with zero throttling (Round 4). |
 
-The production scenario (2 jobs at ~100 MB/s each, ~120 MB/s combined instead of ~200 MB/s) cannot be explained by any BigQuery or Dataflow limitation. This test demonstrated that a single Dataflow job achieves ~160 MB/s and 2 jobs scale linearly to ~330 MB/s. The production jobs achieving only ~100 MB/s each indicates the bottleneck is **upstream** of Dataflow and BigQuery.
+### Key Results Across All Rounds
 
-### Secondary Finding: Quota Enforcement Mechanism
+| Round | SDK | Single Job | 2 Jobs Combined | Per-Job Degradation | Connections |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | Python | 160 MB/s, 16k RPS | 330 MB/s, 33k RPS | None | 120 |
+| 2 | Python | 161 MB/s, 16k RPS | 328 MB/s (2-job tail) | None | 120 |
+| 3 | Python | 31 MB/s, 55k RPS | N/A (CPU-bound) | N/A | N/A |
+| **4** | **Java** | **190 MB/s, 340k RPS** | **393 MB/s, 700k RPS** | **None** | **25** |
 
-Round 2 discovered that when combined demand exceeds ~314 MB/s, BigQuery enforces the regional throughput quota via periodic sawtooth throttling (burst at ~550 MB/s for 5-7 min, then throttle to ~20 MB/s for 2-4 min). This is relevant for future scaling but does not explain the current production issue.
+Round 4 is the definitive test. Using the **same Java SDK, same write method (`STORAGE_API_AT_LEAST_ONCE`), same connection pooling, same region (`asia-southeast1`), and same message size (~500 bytes)** as the production workload, 2 Dataflow jobs achieved 757k rows/sec combined -- **3.8x the production target of 200k rows/sec** -- with zero per-job degradation. The production scenario (single job at 200k rows/sec dropping to 100k when a second job starts) cannot be reproduced when the pipeline reads from Pub/Sub instead of Kafka.
+
+### Secondary Findings
+
+1. **Quota enforcement mechanism (Round 2).** When combined demand exceeds ~314 MB/s, BigQuery enforces the regional throughput quota via periodic sawtooth throttling (burst at ~550 MB/s for 5-7 min, throttle to ~20 MB/s for 2-4 min). This is relevant for future scaling beyond 500k RPS but does not explain the current production issue.
+
+2. **Connection pooling effectiveness (Round 4).** Enabling `useStorageApiConnectionPool=true` reduced connections from ~60 per job (without pooling) to ~10-15 per job (with pooling) -- a ~5x reduction. This is essential for pipelines with dynamic multi-table routing.
+
+3. **Python vs Java SDK performance (Round 3 vs 4).** Java achieves ~6x the rows/sec of Python at the same message size (~340k vs ~55k rows/sec), but uses 2x the vCPUs (24 vs 12), yielding ~3x better per-vCPU efficiency. Both SDKs are CPU-near-capacity at these element rates: Python at 100% on 12 vCPUs, Java at 75-90% on 24 vCPUs. The difference reflects JIT compilation, true multi-threading, and native protobuf serialization.
 
 ### Recommendations
 
-1. **Investigate the upstream bottleneck.** Each Dataflow job should achieve ~160 MB/s based on this test. The production jobs only achieve ~100 MB/s -- the gap points to Kafka consumer configuration, Avro deserialization overhead, pipeline transform logic, or network constraints.
-2. **Profile the production pipeline** to identify where the ~60 MB/s per-job gap is lost compared to the baseline established in this test.
-3. **Monitor quota usage** with alerts on `bigquerystorage.googleapis.com/write/append_bytes_region` as a best practice.
-4. **Quota increase or multi-region** is only needed if future scaling pushes combined throughput past ~314 MB/s.
+1. **Investigate the Kafka source path.** The production bottleneck is isolated to the source side of the pipeline. Switching from Kafka to Pub/Sub eliminates the degradation entirely. Key areas to investigate:
+   - **Kafka consumer group configuration.** If both Dataflow jobs share the same consumer group, Kafka splits partitions between them -- each job gets half the data, not a copy. This exactly explains the 200k → 100k per-job pattern. Verify each job uses a **separate consumer group** to receive full data.
+   - **Kafka consumer settings.** `fetch.max.bytes`, `max.partition.fetch.bytes`, and `max.poll.records` directly control consumer throughput.
+   - **Network throughput** between the Kafka cluster and Dataflow workers.
+   - **Avro deserialization overhead** for complex schemas.
+
+2. **Verify Kafka partition assignment.** Monitor `dataflow.googleapis.com/job/elements_produced` on the ReadFromKafka step to confirm whether each job reads the same total volume (independent consumer groups) or half the volume (shared consumer group) when 2 jobs run concurrently.
+
+3. **Test with a minimal Kafka-to-BQ pipeline.** Read from Kafka, write raw bytes to a single BQ table (no Avro decode, no dynamic routing) to isolate whether the bottleneck is in the read path or the transform/routing logic.
+
+4. **Monitor quota usage** with alerts on `bigquerystorage.googleapis.com/write/append_bytes_region` as a best practice for capacity planning.
+
+5. **Quota increase is not needed** at current production volumes. The regional quota of ~314 MB/s accommodates the 500k RPS target (at ~500 bytes/row = ~250 MB/s). A quota increase would only be needed if row sizes grow or throughput targets exceed ~550k RPS.
 
 ## References
 

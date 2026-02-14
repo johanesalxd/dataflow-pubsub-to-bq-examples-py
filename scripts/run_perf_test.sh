@@ -17,8 +17,11 @@
 #   ./scripts/run_perf_test.sh setup            # create GCP resources
 #   ./scripts/run_perf_test.sh publish           # launch Dataflow publisher
 #   ./scripts/run_perf_test.sh publish-status    # check publisher job status
-#   ./scripts/run_perf_test.sh job a             # launch consumer Job A
-#   ./scripts/run_perf_test.sh job b             # launch consumer Job B
+#   ./scripts/run_perf_test.sh job a             # launch Python consumer Job A
+#   ./scripts/run_perf_test.sh job b             # launch Python consumer Job B
+#   ./scripts/run_perf_test.sh java-setup        # build Java pipeline JAR
+#   ./scripts/run_perf_test.sh java-job a        # launch Java consumer Job A
+#   ./scripts/run_perf_test.sh java-job b        # launch Java consumer Job B
 #   ./scripts/run_perf_test.sh monitor           # print monitoring URLs
 #   ./scripts/run_perf_test.sh dry-run           # validate message sizes
 
@@ -41,6 +44,11 @@ CONSUMER_NUM_WORKERS=3
 CONSUMER_MACHINE_TYPE="n2-standard-4"
 PUBLISHER_NUM_WORKERS=5
 PUBLISHER_MACHINE_TYPE="n2-standard-4"
+
+# Java consumer configuration (matches production: 3x n2-highcpu-8 = 24 vCPUs)
+JAVA_CONSUMER_NUM_WORKERS=3
+JAVA_CONSUMER_MACHINE_TYPE="n2-highcpu-8"
+JAR_FILE="java/target/dataflow-pubsub-to-bq-json-1.0-SNAPSHOT.jar"
 
 # Message configuration
 NUM_MESSAGES=400000000   # 400M msgs = ~200 GB = ~20 min at 160 MB/s (500-byte msgs)
@@ -72,7 +80,8 @@ print_config() {
     echo "  BQ Table:           ${FULL_TABLE}"
     echo "  Topic:              ${FULL_TOPIC}"
     echo "  Consumers:          ${NUM_CONSUMERS}"
-    echo "  Consumer workers:   ${CONSUMER_NUM_WORKERS}x ${CONSUMER_MACHINE_TYPE}"
+    echo "  Consumer workers:   ${CONSUMER_NUM_WORKERS}x ${CONSUMER_MACHINE_TYPE} (Python)"
+    echo "  Java consumers:    ${JAVA_CONSUMER_NUM_WORKERS}x ${JAVA_CONSUMER_MACHINE_TYPE} (Java)"
     echo "  Publisher workers:  ${PUBLISHER_NUM_WORKERS}x ${PUBLISHER_MACHINE_TYPE}"
     echo "  Messages:           ${NUM_MESSAGES}"
     echo "  Message size:       ${MESSAGE_SIZE_BYTES} bytes"
@@ -313,6 +322,95 @@ do_job() {
     echo ""
 }
 
+do_java_setup() {
+    echo "=== Building Java Pipeline ==="
+    echo ""
+
+    # Check for Maven
+    if ! command -v mvn &>/dev/null; then
+        echo "ERROR: Maven (mvn) is not installed or not in PATH."
+        echo "       Install Maven: https://maven.apache.org/install.html"
+        exit 1
+    fi
+
+    echo "Building Java project..."
+    mvn -f java/pom.xml clean package -DskipTests
+
+    if [[ ! -f "${JAR_FILE}" ]]; then
+        echo "ERROR: JAR file not found at ${JAR_FILE}"
+        exit 1
+    fi
+
+    echo ""
+    echo "=== Java Build Complete ==="
+    echo "  JAR: ${JAR_FILE}"
+    echo ""
+    echo "Next: ./scripts/run_perf_test.sh java-job <label>"
+    echo ""
+}
+
+do_java_job() {
+    local LABEL="$1"
+
+    # Validate label
+    if [[ -z "${LABEL}" ]]; then
+        echo "ERROR: Job label required. Usage: $0 java-job <a|b|c|d|...>"
+        exit 1
+    fi
+
+    # Verify JAR exists
+    if [[ ! -f "${JAR_FILE}" ]]; then
+        echo "ERROR: JAR file not found at ${JAR_FILE}"
+        echo "       Run './scripts/run_perf_test.sh java-setup' first."
+        exit 1
+    fi
+
+    local SUB_NAME="perf_test_sub_${LABEL}"
+    local FULL_SUB="projects/${PROJECT_ID}/subscriptions/${SUB_NAME}"
+    local JOB_NAME="dataflow-perf-java-${LABEL}-$(date +%Y%m%d-%H%M%S)"
+
+    # Verify subscription exists
+    if ! gcloud pubsub subscriptions describe "${SUB_NAME}" --project="${PROJECT_ID}" 2>/dev/null; then
+        echo "ERROR: Subscription ${SUB_NAME} does not exist."
+        echo "       Set NUM_CONSUMERS high enough and re-run setup."
+        exit 1
+    fi
+
+    echo "=== Launching Java Consumer Job ${LABEL^^} ==="
+    echo "  Job name:       ${JOB_NAME}"
+    echo "  Subscription:   ${FULL_SUB}"
+    echo "  Workers:        ${JAVA_CONSUMER_NUM_WORKERS}x ${JAVA_CONSUMER_MACHINE_TYPE}"
+    echo "  Write method:   STORAGE_API_AT_LEAST_ONCE"
+    echo "  Connection pool: enabled"
+    echo "  BQ table:       ${FULL_TABLE}"
+    echo ""
+
+    java -jar "${JAR_FILE}" \
+        --runner=DataflowRunner \
+        --project="${PROJECT_ID}" \
+        --region="${REGION}" \
+        --jobName="${JOB_NAME}" \
+        --tempLocation="${TEMP_BUCKET}/temp" \
+        --stagingLocation="${TEMP_BUCKET}/staging" \
+        --subscription="${FULL_SUB}" \
+        --outputTable="${FULL_TABLE}" \
+        --subscriptionName="${SUB_NAME}" \
+        --streaming \
+        --experiments=use_runner_v2 \
+        --workerMachineType="${JAVA_CONSUMER_MACHINE_TYPE}" \
+        --numWorkers="${JAVA_CONSUMER_NUM_WORKERS}" \
+        --maxNumWorkers="${JAVA_CONSUMER_NUM_WORKERS}" \
+        --enableStreamingEngine \
+        --useStorageApiConnectionPool=true
+
+    echo ""
+    echo "=== Java Consumer Job ${LABEL^^} Submitted ==="
+    echo ""
+    echo "View job at:"
+    echo "  https://console.cloud.google.com/dataflow/jobs/${REGION}?project=${PROJECT_ID}"
+    echo ""
+}
+
 do_monitor() {
     print_config
     echo "--- Console Links ---"
@@ -407,6 +505,12 @@ case "${COMMAND}" in
     job)
         do_job "${2}"
         ;;
+    java-setup)
+        do_java_setup
+        ;;
+    java-job)
+        do_java_job "${2}"
+        ;;
     monitor)
         do_monitor
         ;;
@@ -414,17 +518,19 @@ case "${COMMAND}" in
         do_dry_run
         ;;
     *)
-        echo "Usage: $0 {setup|publish|publish-status|job <label>|monitor|dry-run}"
+        echo "Usage: $0 {setup|publish|publish-status|job <label>|java-setup|java-job <label>|monitor|dry-run}"
         echo ""
         echo "Commands:"
         echo "  setup            Create all GCP resources (topic, subs, BQ table)"
         echo "  publish          Launch Dataflow publisher (batch, auto-terminates)"
         echo "  publish-status   Check publisher job status"
-        echo "  job <label>      Launch consumer Job <label> (e.g., job a, job b)"
+        echo "  job <label>      Launch Python consumer Job <label> (e.g., job a, job b)"
+        echo "  java-setup       Build Java pipeline JAR (requires Maven)"
+        echo "  java-job <label> Launch Java consumer Job <label> (e.g., java-job a)"
         echo "  monitor          Print monitoring URLs and metric names"
         echo "  dry-run          Validate message sizes without publishing"
         echo ""
-        echo "Typical workflow:"
+        echo "Typical workflow (Python consumer):"
         echo "  1. ./scripts/run_perf_test.sh setup"
         echo "  2. ./scripts/run_perf_test.sh publish"
         echo "  3. ./scripts/run_perf_test.sh publish-status  # wait for Done"
@@ -433,6 +539,17 @@ case "${COMMAND}" in
         echo "  6. ./scripts/run_perf_test.sh job b            # Phase 2 noisy neighbor"
         echo "  7. ./scripts/run_perf_test.sh monitor"
         echo "  8. ./scripts/cleanup_perf_test.sh"
+        echo ""
+        echo "Typical workflow (Java consumer -- 200k RPS reproduction):"
+        echo "  1. ./scripts/run_perf_test.sh setup"
+        echo "  2. ./scripts/run_perf_test.sh java-setup"
+        echo "  3. ./scripts/run_perf_test.sh publish"
+        echo "  4. ./scripts/run_perf_test.sh publish-status   # wait for backlog"
+        echo "  5. ./scripts/run_perf_test.sh java-job a       # Phase 1: target 200k RPS"
+        echo "  6. Wait 10 min for steady state"
+        echo "  7. ./scripts/run_perf_test.sh java-job b       # Phase 2: observe degradation"
+        echo "  8. ./scripts/run_perf_test.sh monitor"
+        echo "  9. ./scripts/cleanup_perf_test.sh"
         exit 1
         ;;
 esac
