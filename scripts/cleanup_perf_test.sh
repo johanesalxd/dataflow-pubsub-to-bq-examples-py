@@ -153,7 +153,7 @@ fi
 
 # Avro pipeline typed tables (round 5)
 for STATUS in enroute pickup dropoff waiting; do
-    local AVRO_TABLE="${FULL_TABLE}_${STATUS}"
+    AVRO_TABLE="${FULL_TABLE}_${STATUS}"
     echo -n "  Table: ${AVRO_TABLE} ... "
     if bq show "${AVRO_TABLE}" 2>/dev/null; then
         bq rm -f -t "${AVRO_TABLE}"

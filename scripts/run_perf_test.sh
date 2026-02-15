@@ -55,7 +55,7 @@ JAVA_CONSUMER_MACHINE_TYPE="n2-highcpu-8"
 JAR_FILE="java/target/dataflow-pubsub-to-bq-json-1.0-SNAPSHOT.jar"
 
 # Message configuration
-NUM_MESSAGES=400000000   # 400M msgs = ~200 GB = ~20 min at 160 MB/s (500-byte msgs)
+NUM_MESSAGES=400000000   # 400M msgs = ~35 GB Avro
 MESSAGE_SIZE_BYTES=500
 
 # BigQuery write semantics: set to true for at-least-once, false for exactly-once
