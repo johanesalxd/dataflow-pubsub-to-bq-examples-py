@@ -37,6 +37,15 @@ class PublisherPipelineOptions(PipelineOptions):
             help="Target size per message in bytes (default: 10000).",
         )
         parser.add_argument(
+            "--format",
+            type=str,
+            default="json",
+            choices=["json", "avro"],
+            help="Message serialization format. json=padded JSON (default), "
+            "avro=Avro binary (~85 bytes, no padding). When avro is selected, "
+            "--message_size_bytes is ignored.",
+        )
+        parser.add_argument(
             "--validate_only",
             action="store_true",
             default=False,

@@ -37,9 +37,13 @@ from apache_beam.options.pipeline_options import PipelineOptions
 from dataflow_pubsub_to_bq.pipeline_publisher_options import PublisherPipelineOptions
 from dataflow_pubsub_to_bq.transforms.synthetic_messages import (
     _BQ_METADATA_OVERHEAD_BYTES,
+    calculate_avro_rates,
     calculate_rates,
+    generate_avro_message_pool,
+    generate_avro_record,
     generate_message,
     generate_message_pool,
+    serialize_avro_record,
 )
 
 # Number of seed elements to create for parallelism. Each seed generates
@@ -75,19 +79,61 @@ def generate_batch(
     return result
 
 
-def run_validate_only(num_messages: int, message_size_bytes: int) -> None:
+def generate_avro_batch(seed_count: tuple[int, int]) -> list[bytes]:
+    """Generates a batch of Avro-encoded messages for one seed element.
+
+    Same pooling strategy as ``generate_batch()`` but produces Avro
+    binary bytes. Message size is schema-determined (~85 bytes), not
+    configurable via ``message_size_bytes``.
+
+    Args:
+        seed_count: Tuple of (seed_index, num_messages).
+
+    Returns:
+        List of Avro binary encoded message bytes.
+    """
+    num_messages = seed_count[1]
+    pool_size = min(_POOL_SIZE, num_messages)
+    pool = generate_avro_message_pool(pool_size)
+    result: list[bytes] = []
+    for i in range(num_messages):
+        result.append(pool[i % pool_size])
+    return result
+
+
+def run_validate_only(
+    num_messages: int, message_size_bytes: int, fmt: str = "json"
+) -> None:
     """Validates message sizes and reports rate calculations.
 
     Generates sample messages, measures actual sizes, and prints
-    estimated BQ write throughput at an assumed 100 MB/s publish rate.
+    estimated BQ write throughput. Supports both JSON and Avro formats.
     No pipeline is launched and nothing is published.
 
     Args:
         num_messages: Total number of messages that would be published.
-        message_size_bytes: Target size per message in bytes.
+        message_size_bytes: Target size per message in bytes (JSON only).
+        fmt: Message format, either ``json`` or ``avro``.
     """
     sample_count = 10_000
-    logging.info("Generating %d sample messages...", sample_count)
+
+    if fmt == "avro":
+        _run_validate_avro(num_messages, sample_count)
+    else:
+        _run_validate_json(num_messages, message_size_bytes, sample_count)
+
+
+def _run_validate_json(
+    num_messages: int, message_size_bytes: int, sample_count: int
+) -> None:
+    """Validates JSON message sizes and reports rate calculations.
+
+    Args:
+        num_messages: Total number of messages that would be published.
+        message_size_bytes: Target size per message in bytes.
+        sample_count: Number of sample messages to generate.
+    """
+    logging.info("Generating %d sample JSON messages...", sample_count)
 
     sizes: list[int] = []
     for _ in range(sample_count):
@@ -105,7 +151,7 @@ def run_validate_only(num_messages: int, message_size_bytes: int) -> None:
     total_bytes = num_messages * message_size_bytes
     total_gb = total_bytes / 1_000_000_000
 
-    print("\n=== Dry Run Report ===")
+    print("\n=== Dry Run Report (JSON) ===")
     print(f"Sample messages generated: {sample_count:,}")
     print(f"Target message size:       {message_size_bytes:,} bytes")
     print(
@@ -162,6 +208,88 @@ def run_validate_only(num_messages: int, message_size_bytes: int) -> None:
     print()
 
 
+def _run_validate_avro(num_messages: int, sample_count: int) -> None:
+    """Validates Avro message sizes and reports expansion ratio.
+
+    Args:
+        num_messages: Total number of messages that would be published.
+        sample_count: Number of sample messages to generate.
+    """
+    logging.info("Generating %d sample Avro messages...", sample_count)
+
+    sizes: list[int] = []
+    for _ in range(sample_count):
+        record = generate_avro_record()
+        avro_bytes = serialize_avro_record(record)
+        sizes.append(len(avro_bytes))
+
+    avg_size = sum(sizes) / len(sizes)
+    min_size = min(sizes)
+    max_size = max(sizes)
+
+    # Target 25 MB/s Avro source throughput (matches production)
+    assumed_source_mbps = 25.0
+    rates = calculate_avro_rates(assumed_source_mbps, avg_size)
+
+    total_bytes = int(num_messages * avg_size)
+    total_gb = total_bytes / 1_000_000_000
+
+    print("\n=== Dry Run Report (Avro) ===")
+    print(f"Sample messages generated: {sample_count:,}")
+    print(
+        f"Avro message size:         avg={avg_size:.0f}, "
+        f"min={min_size}, max={max_size} bytes"
+    )
+    print("  (no padding -- size is schema-determined)")
+    print()
+    print(f"Total messages:            {num_messages:,}")
+    print(f"Total Avro data:           ~{total_gb:.1f} GB")
+    print()
+    print(f"At assumed {assumed_source_mbps:.0f} MB/s Avro source rate:")
+    print(f"  Message rate:            {rates['msgs_per_sec']:,.0f} msgs/sec")
+    print(f"  Avro wire throughput:    {rates['avro_publish_mbps']:.1f} MB/s (source)")
+    print(
+        f"  Pub/Sub streams needed:  {rates['pubsub_streams_needed']:.0f} "
+        f"(at 10 MB/s per StreamingPull)"
+    )
+    print()
+    print(f"  Estimated TableRow size: {rates['estimated_tablerow_size']:.0f} bytes")
+    print(f"  Expansion ratio:         {rates['expansion_ratio']:.1f}x")
+    print(
+        f"  BQ sink throughput:      {rates['bq_sink_mbps']:.1f} MB/s (Dataflow dashboard)"
+    )
+    print()
+    print(f"  At {assumed_source_mbps:.0f} MB/s source:")
+    drain_seconds = total_bytes / (assumed_source_mbps * 1_000_000)
+    print(f"    Drain time:            {drain_seconds / 60:.0f} min")
+    print()
+    print("  Two jobs at this rate:")
+    two_job_mbps = rates["bq_sink_mbps"] * 2
+    print(f"    Combined BQ sink:      {two_job_mbps:.1f} MB/s")
+    print(f"    Regional quota usage:  {two_job_mbps / 300 * 100:.1f}%")
+    print()
+
+    # Verify a sample Avro record round-trips correctly
+    sample = generate_avro_record()
+    expected_fields = [
+        "ride_id",
+        "point_idx",
+        "latitude",
+        "longitude",
+        "timestamp",
+        "meter_reading",
+        "meter_increment",
+        "ride_status",
+        "passenger_count",
+    ]
+    missing = [f for f in expected_fields if f not in sample]
+    if missing:
+        print(f"WARNING: Sample record missing fields: {missing}")
+    else:
+        print("Sample message validation: OK (Avro record, all taxi fields present)")
+    print()
+
+
 def run(argv: list[str] | None = None):
     """Runs the synthetic data publisher pipeline.
 
@@ -177,9 +305,10 @@ def run(argv: list[str] | None = None):
 
     num_messages = custom_options.num_messages
     message_size_bytes = custom_options.message_size_bytes
+    fmt = custom_options.format
 
     if custom_options.validate_only:
-        run_validate_only(num_messages, message_size_bytes)
+        run_validate_only(num_messages, message_size_bytes, fmt)
         return
 
     topic = custom_options.topic
@@ -190,23 +319,46 @@ def run(argv: list[str] | None = None):
     msgs_per_seed = num_messages // _NUM_SEEDS
     remainder = num_messages % _NUM_SEEDS
 
-    total_bytes = num_messages * message_size_bytes
-    total_gb = total_bytes / 1_000_000_000
+    if fmt == "avro":
+        # Avro message size is schema-determined, measure from a sample
+        sample_bytes = serialize_avro_record(generate_avro_record())
+        sample_size = len(sample_bytes)
+        total_bytes = num_messages * sample_size
+        total_gb = total_bytes / 1_000_000_000
 
-    logging.info("Publisher pipeline configuration:")
-    logging.info("  Topic:              %s", topic)
-    logging.info("  Total messages:     %d", num_messages)
-    logging.info("  Message size:       %d bytes", message_size_bytes)
-    logging.info("  Total data:         %.1f GB", total_gb)
-    logging.info("  Seeds:              %d", _NUM_SEEDS)
-    logging.info("  Messages per seed:  %d (+%d remainder)", msgs_per_seed, remainder)
+        logging.info("Publisher pipeline configuration (Avro):")
+        logging.info("  Topic:              %s", topic)
+        logging.info("  Format:             avro")
+        logging.info("  Total messages:     %d", num_messages)
+        logging.info("  Avro message size:  %d bytes (schema-determined)", sample_size)
+        logging.info("  Total data:         %.1f GB", total_gb)
+        logging.info("  Seeds:              %d", _NUM_SEEDS)
+        logging.info(
+            "  Messages per seed:  %d (+%d remainder)", msgs_per_seed, remainder
+        )
+    else:
+        total_bytes = num_messages * message_size_bytes
+        total_gb = total_bytes / 1_000_000_000
 
-    # Verify message size with a sample
-    sample = generate_message(message_size_bytes)
-    sample_size = len(sample.encode("utf-8"))
-    logging.info(
-        "  Sample message size: %d bytes (target: %d)", sample_size, message_size_bytes
-    )
+        logging.info("Publisher pipeline configuration:")
+        logging.info("  Topic:              %s", topic)
+        logging.info("  Format:             json")
+        logging.info("  Total messages:     %d", num_messages)
+        logging.info("  Message size:       %d bytes", message_size_bytes)
+        logging.info("  Total data:         %.1f GB", total_gb)
+        logging.info("  Seeds:              %d", _NUM_SEEDS)
+        logging.info(
+            "  Messages per seed:  %d (+%d remainder)", msgs_per_seed, remainder
+        )
+
+        # Verify message size with a sample
+        sample = generate_message(message_size_bytes)
+        sample_size = len(sample.encode("utf-8"))
+        logging.info(
+            "  Sample message size: %d bytes (target: %d)",
+            sample_size,
+            message_size_bytes,
+        )
 
     with beam.Pipeline(options=pipeline_options) as pipeline:
         # Create seed elements for parallelism. Each seed produces a
@@ -218,17 +370,25 @@ def run(argv: list[str] | None = None):
             if count > 0:
                 seeds_with_counts.append((i, count))
 
-        (
-            pipeline
-            | "CreateSeeds" >> beam.Create(seeds_with_counts)
-            | "GenerateMessages"
-            >> beam.FlatMap(
-                lambda seed_count, size=message_size_bytes: generate_batch(
-                    seed_count[0], seed_count[1], size
-                )
+        if fmt == "avro":
+            (
+                pipeline
+                | "CreateSeeds" >> beam.Create(seeds_with_counts)
+                | "GenerateAvroMessages" >> beam.FlatMap(generate_avro_batch)
+                | "PublishToPubSub" >> pubsub.WriteToPubSub(topic=topic)
             )
-            | "PublishToPubSub" >> pubsub.WriteToPubSub(topic=topic)
-        )
+        else:
+            (
+                pipeline
+                | "CreateSeeds" >> beam.Create(seeds_with_counts)
+                | "GenerateMessages"
+                >> beam.FlatMap(
+                    lambda seed_count, size=message_size_bytes: generate_batch(
+                        seed_count[0], seed_count[1], size
+                    )
+                )
+                | "PublishToPubSub" >> pubsub.WriteToPubSub(topic=topic)
+            )
 
 
 if __name__ == "__main__":

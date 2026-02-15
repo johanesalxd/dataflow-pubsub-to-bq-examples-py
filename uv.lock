@@ -324,6 +324,7 @@ version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "apache-beam", extra = ["gcp"] },
+    { name = "fastavro" },
 ]
 
 [package.dev-dependencies]
@@ -333,7 +334,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "apache-beam", extras = ["gcp"], specifier = "==2.70.0" }]
+requires-dist = [
+    { name = "apache-beam", extras = ["gcp"], specifier = "==2.70.0" },
+    { name = "fastavro", specifier = ">=1.12.1" },
+]
 
 [package.metadata.requires-dev]
 dev = [
