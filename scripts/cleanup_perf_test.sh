@@ -9,7 +9,9 @@
 #   1. Dataflow jobs (cancelled if running)
 #   2. Pub/Sub subscriptions (perf_test_sub_a, perf_test_sub_b, ...)
 #   3. Pub/Sub topic (perf_test_topic)
-#   4. BigQuery tables (taxi_events_perf, taxi_events_perf_dlq)
+#   4. BigQuery tables:
+#      - JSON pipeline: taxi_events_perf, taxi_events_perf_dlq
+#      - Avro pipeline:  taxi_events_perf_enroute, _pickup, _dropoff, _waiting
 #
 # Resources NOT deleted (shared across pipelines):
 #   - GCS bucket
@@ -44,11 +46,12 @@ fi
 echo "=== BQ Throughput Test Cleanup ==="
 echo ""
 echo "This will delete the following resources:"
-echo "  Dataflow jobs:   dataflow-perf-test-* and dataflow-perf-publisher-*"
+echo "  Dataflow jobs:   dataflow-perf-* (test, publisher, avro)"
 echo "  Subscriptions:   perf_test_sub_{a..h} (if they exist)"
 echo "  Topic:           ${TOPIC}"
 echo "  BigQuery tables: ${FULL_TABLE}"
 echo "                   ${FULL_TABLE}_dlq"
+echo "                   ${FULL_TABLE}_enroute, _pickup, _dropoff, _waiting"
 echo ""
 
 if [[ "${FORCE}" != true ]]; then
@@ -147,6 +150,18 @@ if bq show "${FULL_TABLE}_dlq" 2>/dev/null; then
 else
     echo "not found (skipping)."
 fi
+
+# Avro pipeline typed tables (round 5)
+for STATUS in enroute pickup dropoff waiting; do
+    local AVRO_TABLE="${FULL_TABLE}_${STATUS}"
+    echo -n "  Table: ${AVRO_TABLE} ... "
+    if bq show "${AVRO_TABLE}" 2>/dev/null; then
+        bq rm -f -t "${AVRO_TABLE}"
+        echo "deleted."
+    else
+        echo "not found (skipping)."
+    fi
+done
 
 echo ""
 echo "=== Cleanup Complete ==="
