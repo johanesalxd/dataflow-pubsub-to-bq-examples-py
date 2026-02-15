@@ -43,6 +43,13 @@
             <version>${beam.version}</version>
         </dependency>
 
+        <!-- Avro -->
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>1.11.3</version>
+        </dependency>
+
         <!-- Utilities -->
         <dependency>
             <groupId>org.json</groupId>
